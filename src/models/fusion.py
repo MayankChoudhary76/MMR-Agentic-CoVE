@@ -1,104 +1,171 @@
 # src/models/fusion.py
 from __future__ import annotations
-from typing import Optional, Tuple
+
 import numpy as np
+from typing import Optional, Sequence, Tuple
+
+__all__ = ["l2norm", "concat_fusion", "weighted_sum_fusion"]
 
 
-def _l2norm(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    n = np.linalg.norm(x, axis=1, keepdims=True) + eps
-    return x / n
+def _as_float32(x: np.ndarray | Sequence) -> np.ndarray:
+    """Cast to contiguous float32 ndarray (2D if possible)."""
+    arr = np.asarray(x)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, arr.shape[-1])
+    return np.ascontiguousarray(arr, dtype=np.float32)
 
 
-def _safe_array(a: Optional[np.ndarray]) -> Optional[np.ndarray]:
-    if a is None:
-        return None
-    if isinstance(a, list):
-        a = np.array(a, dtype=np.float32)
-    return a.astype(np.float32, copy=False)
+def l2norm(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    """
+    L2-normalize a 2D array [N, D] along the last dimension.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Array of shape [N, D].
+    eps : float
+        Small number to avoid division by zero.
+
+    Returns
+    -------
+    np.ndarray
+        L2-normalized array (float32) of shape [N, D].
+    """
+    x = _as_float32(x)
+    norms = np.linalg.norm(x, axis=1, keepdims=True) + eps
+    return x / norms
 
 
-def _pad_to(a: np.ndarray, dim: int) -> np.ndarray:
-    """Right‑pad a to target dim with zeros if needed."""
-    if a.shape[1] == dim:
-        return a
-    if a.shape[1] < dim:
-        pad = np.zeros((a.shape[0], dim - a.shape[1]), dtype=a.dtype)
-        return np.concatenate([a, pad], axis=1)
-    # if larger, trim
-    return a[:, :dim]
+def _gather_modalities(
+    Vt: Optional[np.ndarray] = None,
+    Vi: Optional[np.ndarray] = None,
+    Vm: Optional[np.ndarray] = None,
+) -> Tuple[list[np.ndarray], list[str]]:
+    """Collect non-None modality matrices in consistent order."""
+    blocks, names = [], []
+    if Vt is not None:
+        blocks.append(_as_float32(Vt)); names.append("text")
+    if Vi is not None:
+        blocks.append(_as_float32(Vi)); names.append("image")
+    if Vm is not None:
+        blocks.append(_as_float32(Vm)); names.append("meta")
+    if not blocks:
+        raise ValueError("At least one modality (Vt/Vi/Vm) must be provided.")
+    # Sanity: same item count across blocks
+    n = {b.shape[0] for b in blocks}
+    if len(n) != 1:
+        raise ValueError(f"All modalities must have same N items, got Ns={n}.")
+    return blocks, names
 
 
 def concat_fusion(
-    Vt: np.ndarray,
+    Vt: Optional[np.ndarray] = None,
     Vi: Optional[np.ndarray] = None,
     Vm: Optional[np.ndarray] = None,
-    weights: Tuple[float, float, float] | None = None,
+    weights: Optional[Sequence[float]] = None,
 ) -> np.ndarray:
     """
-    Concatenate available modality vectors (text, image, meta).
-    Optionally scale each modality by a weight before concat.
-    Returns L2‑normalized fused matrix.
+    Concatenate modality vectors (optionally weighted per block) and L2-normalize.
+
+    Parameters
+    ----------
+    Vt, Vi, Vm : np.ndarray or None
+        Matrices of shape [I, Dt], [I, Di], [I, Dm].
+    weights : sequence of floats or None
+        Optional per-modality weights in the order (text, image, meta).
+        Missing modalities are skipped; when None, all used modalities get weight=1.
+
+    Returns
+    -------
+    np.ndarray
+        Fused item matrix of shape [I, Dt+Di+Dm_used], L2-normalized.
     """
-    Vt = _safe_array(Vt)
-    Vi = _safe_array(Vi)
-    Vm = _safe_array(Vm)
+    blocks, names = _gather_modalities(Vt, Vi, Vm)
 
+    # Build weights aligned to available modalities
     if weights is None:
-        wt, wi, wm = 1.0, 1.0, 1.0
+        w = [1.0] * len(blocks)
     else:
-        wt, wi, wm = weights
+        # Map full tuple -> subset by names present
+        name_order = ["text", "image", "meta"]
+        full = dict(zip(name_order, list(weights) + [1.0] * (3 - len(weights))))
+        w = [float(full[n]) for n in names]
 
-    parts = []
-    if Vt is not None:
-        parts.append(wt * Vt)
-    if Vi is not None:
-        parts.append(wi * Vi)
-    if Vm is not None:
-        parts.append(wm * Vm)
+    # Apply weights per block
+    weighted = [b * w_i for b, w_i in zip(blocks, w)]
 
-    if not parts:
-        raise ValueError("At least one modality must be provided to concat_fusion")
+    fused = np.concatenate(weighted, axis=1)
+    return l2norm(fused)
 
-    fused = np.concatenate(parts, axis=1)
-    return _l2norm(fused)
+
+def _pad_to_dim(x: np.ndarray, target_dim: int) -> np.ndarray:
+    """
+    Zero-pad vectors to target_dim along the last axis.
+
+    Parameters
+    ----------
+    x : [N, D]
+    target_dim : int
+
+    Returns
+    -------
+    [N, target_dim]
+    """
+    x = _as_float32(x)
+    N, D = x.shape
+    if D == target_dim:
+        return x
+    if D > target_dim:
+        # If any block is larger than target, bump target up
+        raise ValueError(f"Block has dim {D} > target_dim {target_dim}.")
+    out = np.zeros((N, target_dim), dtype=np.float32)
+    out[:, :D] = x
+    return out
 
 
 def weighted_sum_fusion(
-    Vt: np.ndarray,
+    Vt: Optional[np.ndarray] = None,
     Vi: Optional[np.ndarray] = None,
     Vm: Optional[np.ndarray] = None,
-    weights: Tuple[float, float, float] | None = None,
+    weights: Optional[Sequence[float]] = None,
 ) -> np.ndarray:
     """
-    Weighted sum across modalities. If dims differ, pad/trim to the
-    **max** dimensionality among provided modalities before summation.
-    Returns L2‑normalized fused matrix.
+    Weighted sum fusion across modalities with automatic zero-padding to a common dim.
+
+    Notes
+    -----
+    - This keeps a simple, dependency-free baseline. We align dimensions by zero-padding
+      smaller blocks to the maximum dimensionality across provided modalities, then sum.
+    - Returned vectors are L2-normalized.
+
+    Parameters
+    ----------
+    Vt, Vi, Vm : np.ndarray or None
+        Matrices of shape [I, Dt], [I, Di], [I, Dm].
+    weights : sequence of floats or None
+        Per-modality weights in order (text, image, meta). If None → weights=1.
+
+    Returns
+    -------
+    np.ndarray
+        Fused item matrix of shape [I, D_max], L2-normalized.
     """
-    Vt = _safe_array(Vt)
-    Vi = _safe_array(Vi)
-    Vm = _safe_array(Vm)
+    blocks, names = _gather_modalities(Vt, Vi, Vm)
 
     if weights is None:
-        wt, wi, wm = 1.0, 1.0, 1.0
+        w = [1.0] * len(blocks)
     else:
-        wt, wi, wm = weights
+        name_order = ["text", "image", "meta"]
+        full = dict(zip(name_order, list(weights) + [1.0] * (3 - len(weights))))
+        w = [float(full[n]) for n in names]
 
-    mats = []
-    dims = []
-    if Vt is not None:
-        mats.append(("t", wt, Vt)); dims.append(Vt.shape[1])
-    if Vi is not None:
-        mats.append(("i", wi, Vi)); dims.append(Vi.shape[1])
-    if Vm is not None:
-        mats.append(("m", wm, Vm)); dims.append(Vm.shape[1])
+    # Determine target dimension
+    dims = [b.shape[1] for b in blocks]
+    D_max = max(dims)
 
-    if not mats:
-        raise ValueError("At least one modality must be provided to weighted_sum_fusion")
+    # Pad, weight, and sum
+    acc = np.zeros((blocks[0].shape[0], D_max), dtype=np.float32)
+    for b, w_i in zip(blocks, w):
+        acc += _pad_to_dim(b, D_max) * w_i
 
-    target_dim = max(dims)
-    acc = None
-    for _, w, M in mats:
-        Mpad = _pad_to(M, target_dim)
-        acc = (w * Mpad) if acc is None else (acc + w * Mpad)
-
-    return _l2norm(acc)
+    return l2norm(acc)
