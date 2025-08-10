@@ -1,0 +1,17 @@
+dataset: beauty
+description: "Amazon Beauty 5-core reviews + metadata"
+registry_key: beauty
+
+download_urls:
+  - name: reviews
+    targets:
+      - https://deepyeti.ucsd.edu/jianmo/amazon/categoryFilesSmall/All_Beauty_5.json.gz
+      - https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/All_Beauty_5.json.gz
+    target: reviews.json
+
+  - name: metadata
+    targets:
+      - https://deepyeti.ucsd.edu/jianmo/amazon/metaFiles2/meta_All_Beauty.json.gz
+      - https://deepyeti.ucsd.edu/jianmo/amazon/metaFiles/meta_All_Beauty.json.gz
+      - https://jmcauley.ucsd.edu/data/amazon_v2/metaFiles/meta_All_Beauty.json.gz
+    target: meta.json
