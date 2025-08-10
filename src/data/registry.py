@@ -1,30 +1,23 @@
 # src/data/registry.py
 from pathlib import Path
-from src.utils.paths import DATA_DIR
+from typing import Dict
+from src.utils.paths import RAW_DIR, PROCESSED_DIR
 
-# Central catalog of datasets -> raw/processed roots
-DATA_REGISTRY = {
-    "beauty": {
-        "raw": DATA_DIR / "raw" / "beauty",
-        "processed": DATA_DIR / "processed" / "beauty",
-    },
-    # Add more datasets here later (e.g., "toys", "electronics", ...)
-}
-
-def get_dataset_paths(dataset_name: str) -> dict:
+def get_paths(dataset: str) -> Dict[str, Path]:
     """
-    Return dict with 'raw' and 'processed' paths.
-    Ensures directories exist so later code can write safely.
+    Return raw and processed directories for a dataset name.
+    Creates them if they do not exist.
     """
-    key = dataset_name.lower()
-    if key not in DATA_REGISTRY:
-        raise ValueError(f"Dataset '{dataset_name}' not found in registry. "
-                         f"Known: {list(DATA_REGISTRY.keys())}")
+    name = dataset.lower()
+    raw_dir = RAW_DIR / name
+    processed_dir = PROCESSED_DIR / name
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    return {"raw_dir": raw_dir, "processed_dir": processed_dir}
 
-    paths = DATA_REGISTRY[key]
+# (optional helpers if you want explicit file paths later)
+def raw_file(dataset: str, filename: str) -> Path:
+    return get_paths(dataset)["raw_dir"] / filename
 
-    # Auto-create directories (idempotent)
-    for k in ("raw", "processed"):
-        Path(paths[k]).mkdir(parents=True, exist_ok=True)
-
-    return paths
+def processed_file(dataset: str, filename: str) -> Path:
+    return get_paths(dataset)["processed_dir"] / filename
