@@ -63,3 +63,5 @@ class TextEncoder:
             out.append(np.asarray(vecs, dtype=np.float32))
 
         return np.vstack(out)
+    
+__all__ = ["TextEncoder"]

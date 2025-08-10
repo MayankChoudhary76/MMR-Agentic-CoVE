@@ -21,3 +21,5 @@ def raw_file(dataset: str, filename: str) -> Path:
 
 def processed_file(dataset: str, filename: str) -> Path:
     return get_paths(dataset)["processed_dir"] / filename
+
+__all__ = ["get_paths"]
