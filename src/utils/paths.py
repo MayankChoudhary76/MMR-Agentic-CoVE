@@ -1,29 +1,37 @@
 from pathlib import Path
 
-# Root of the repository (this file is in src/utils/, so go up two levels)
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+# Base project directory (two levels up from utils/paths.py)
+PROJECT_DIR = Path(__file__).resolve().parents[2]
 
-# Core directories
-SRC_DIR = ROOT_DIR / "src"
-DATA_DIR = ROOT_DIR / "data"
-CONFIGS_DIR = ROOT_DIR / "configs"
-SCRIPTS_DIR = ROOT_DIR / "scripts"
-DOCS_DIR = ROOT_DIR / "docs"
+# Standard data and logs directories
+DATA_DIR = PROJECT_DIR / "data"
+RAW_DIR = DATA_DIR / "raw"
+PROCESSED_DIR = DATA_DIR / "processed"
+LOGS_DIR = PROJECT_DIR / "logs"
+MODELS_DIR = PROJECT_DIR / "models"
 
-# Data subfolders
-RAW_DATA_DIR = DATA_DIR / "raw"
-PROCESSED_DATA_DIR = DATA_DIR / "processed"
-MODELS_DIR = ROOT_DIR / "models"
-LOGS_DIR = ROOT_DIR / "logs"
+def ensure_dir(p):
+    """
+    Create directory if it does not exist.
+    Returns the Path object for the directory.
+    """
+    p = Path(p)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-# Create directories if they don’t exist
-for directory in [
-    DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR,
-    MODELS_DIR, LOGS_DIR
-]:
-    directory.mkdir(parents=True, exist_ok=True)
+# Ensure base dirs exist
+for d in [RAW_DIR, PROCESSED_DIR, LOGS_DIR, MODELS_DIR]:
+    ensure_dir(d)
 
-if __name__ == "__main__":
-    print("Project root:", ROOT_DIR)
-    print("Data folder:", DATA_DIR)
-    print("Configs folder:", CONFIGS_DIR)
+def get_dataset_paths(dataset_name):
+    """
+    Returns a dictionary of key paths for a given dataset.
+    """
+    base = PROCESSED_DIR / dataset_name
+    ensure_dir(base)
+    return {
+        "raw": RAW_DIR / dataset_name,
+        "processed": base,
+        "logs": LOGS_DIR / dataset_name,
+        "models": MODELS_DIR / dataset_name
+    }
