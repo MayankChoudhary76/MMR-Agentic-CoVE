@@ -39,3 +39,5 @@ def normalize_dataset(raw_dir: Path, out_dir: Path) -> dict:
         "items": int(reviews_df["item_id"].nunique()),
         "ratings_mean": float(reviews_df["rating"].mean()),
     }
+
+__all__ = ["normalize_dataset", "load_reviews"]

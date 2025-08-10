@@ -115,3 +115,5 @@ class ImageEncoder:
             mask = np.array(ok, dtype=bool)
             vecs[~mask] = 0.0
         return vecs, ok
+    
+__all__ = ["ImageEncoder"]

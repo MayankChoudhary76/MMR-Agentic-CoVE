@@ -110,3 +110,5 @@ class MetaEncoder:
                 "price_min": self.cfg.price_min,
                 "price_max": self.cfg.price_max
             }, f, indent=2)
+            
+__all__ = ["MetaEncoder"]

@@ -40,3 +40,13 @@ if __name__ == "__main__":
     print("Raw:", get_raw_path("beauty"))
     print("Processed:", get_processed_path("beauty"))
     print("Logs:", get_logs_path())
+    
+__all__ = [
+    "PROJECT_ROOT",
+    "DATA_DIR",
+    "LOGS_DIR",
+    "get_raw_path",
+    "get_processed_path",
+    "get_logs_path",
+    "ensure_dir",
+]

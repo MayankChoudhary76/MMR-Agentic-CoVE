@@ -7,3 +7,5 @@ def load_config(cfg_path: str | Path) -> dict:
         raise FileNotFoundError(f"Config not found: {p}")
     with open(p, "r") as f:
         return yaml.safe_load(f)
+    
+__all__ = ["load_config"]

@@ -169,3 +169,5 @@ def weighted_sum_fusion(
         acc += _pad_to_dim(b, D_max) * w_i
 
     return l2norm(acc)
+
+__all__ = ["l2norm", "concat_fusion", "weighted_sum_fusion"]
