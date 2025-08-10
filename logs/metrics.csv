@@ -1,0 +1,4 @@
+timestamp,dataset,run_name,model,k,hit,ndcg,notes
+2025-08-10T06:21:25,beauty,beauty_text_emb,sentence-transformers/all-MiniLM-L6-v2,10,0.4949186991869919,0.4335114026299469,
+2025-08-10T07:10:19,beauty,beauty_fusion_concat,concat(text+image),10,0.47560975609756095,0.2890295538152628,fusion
+2025-08-10T07:11:03,beauty,beauty_fusion_wsum_a0p7,wsum(a=0.7),10,0.47560975609756095,0.2890295538152628,fusion
