@@ -1,0 +1,11 @@
+{
+  "run_name": "beauty_concat_wt1_wi1_wm0.3",
+  "dataset": "beauty",
+  "fusion": "concat",
+  "w_text": 1.0,
+  "w_image": 1.0,
+  "w_meta": 0.3,
+  "k": 10,
+  "hit@10": 0.8055271506309509,
+  "ndcg@10": 0.28559587035443146
+}

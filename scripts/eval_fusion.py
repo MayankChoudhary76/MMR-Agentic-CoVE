@@ -1,317 +1,280 @@
 #!/usr/bin/env python3
-# Evaluate multimodal fusion baseline (text + image) + optional report & plots.
-#
-# Inputs (must exist):
-#   data/processed/<dataset>/reviews.parquet
-#   data/processed/<dataset>/item_text_emb.parquet   (item_id, vector[Dt])
-#   data/processed/<dataset>/user_text_emb.parquet   (user_id, vector[Dt])
-#   data/processed/<dataset>/item_image_emb.parquet  (item_id, vector[Di])
-#
-# Output:
-#   logs/<run_name>_eval.json
-#   logs/<run_name>_report.json                    (if --report)
-#   logs/metrics.csv                                (append)
-#   logs/plots/<dataset>_k<k>_comparison.png       (if --plot)
-#   logs/plots/<dataset>_k<k>_trend.png            (if --plot)
-#
-# Examples:
-#   PYTHONPATH=$(pwd) python scripts/eval_fusion.py --dataset beauty --fusion concat --k 10 --run_name beauty_fusion_concat
-#   PYTHONPATH=$(pwd) python scripts/eval_fusion.py --dataset beauty --fusion weighted --alpha 0.7 --k 10 --run_name beauty_fusion_wsum_a0p7 --report --plot
-
+# scripts/eval_fusion.py
 from __future__ import annotations
-import argparse, json, math
+
+import argparse
+import csv
+import json
 from pathlib import Path
-from typing import Dict, Tuple, List
+from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
 
 from src.data.registry import get_paths
 from src.models.fusion import concat_fusion, weighted_sum_fusion
-from src.utils.paths import LOGS_DIR
 
 
-# ------------------------ utilities ------------------------ #
-
-def _resolve_processed_dir(dataset: str) -> Path:
+# ---------- path utils ----------
+def _resolve_paths(dataset: str) -> Tuple[Path, Path]:
+    """
+    Resolve raw/processed paths from the registry, being permissive with keys/attrs.
+    """
     paths = get_paths(dataset)
-    if isinstance(paths, dict) and "processed" in paths:
-        return Path(paths["processed"])
+    if isinstance(paths, dict):
+        raw = paths.get("raw") or paths.get("raw_dir") or paths.get("raw_path")
+        proc = (
+            paths.get("processed")
+            or paths.get("processed_dir")
+            or paths.get("proc")
+            or paths.get("processed_path")
+        )
+        if raw and proc:
+            return Path(raw), Path(proc)
+
     if isinstance(paths, (tuple, list)) and len(paths) >= 2:
-        return Path(paths[1])
-    return Path("data/processed") / dataset
+        return Path(paths[0]), Path(paths[1])
+
+    raw = getattr(paths, "raw", None) or getattr(paths, "raw_dir", None) or getattr(paths, "raw_path", None)
+    proc = (
+        getattr(paths, "processed", None)
+        or getattr(paths, "processed_dir", None)
+        or getattr(paths, "processed_path", None)
+    )
+    if raw and proc:
+        return Path(raw), Path(proc)
+
+    # fallback
+    return Path("data/raw") / dataset, Path("data/processed") / dataset
 
 
-def make_loo(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Leave-one-out split per user: last interaction as test, rest as train."""
-    df = df.sort_values(["user_id", "timestamp"])
-    test = df.groupby("user_id", as_index=False).tail(1)
-    train = pd.concat([df, test]).drop_duplicates(keep=False)
-    return train, test
-
-
+# ---------- core helpers ----------
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Cosine similarity between row-wise vectors in a (U x D) and b (I x D)."""
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-    a = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
-    b = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
+    a = a.astype(np.float32, copy=False)
+    b = b.astype(np.float32, copy=False)
+    a /= (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
+    b /= (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
     return a @ b.T
 
 
-def evaluate_topk(user_vecs_df: pd.DataFrame,
-                  item_vec: np.ndarray,
-                  item_ids: List[str],
+def _leave_one_out(df: pd.DataFrame):
+    """
+    Split with leave-one-out by timestamp.
+    expects df with columns: user_id, item_id, timestamp
+    """
+    df = df.sort_values(["user_id", "timestamp"])
+    last = df.groupby("user_id").tail(1)[["user_id", "item_id"]].rename(columns={"item_id": "target"})
+    train = df.merge(last, on="user_id", how="left")
+    train = train[train["item_id"] != train["target"]][["user_id", "item_id"]]
+    test = last
+    return train, test
+
+
+def _pad_to(a: np.ndarray, dim: int) -> np.ndarray:
+    if a.shape[1] == dim:
+        return a
+    if a.shape[1] < dim:
+        pad = np.zeros((a.shape[0], dim - a.shape[1]), dtype=a.dtype)
+        return np.concatenate([a, pad], axis=1)
+    return a[:, :dim]
+
+
+def evaluate_topk(user_vecs: np.ndarray,
+                  item_vecs: np.ndarray,
+                  item_ids: np.ndarray,
                   test: pd.DataFrame,
-                  k: int) -> Dict[str, float]:
-    """
-    Compute Hit@K and NDCG@K over users that exist in user_vecs_df and test.
-    user_vecs_df: DataFrame with ['user_id','vector'] where vector is np.ndarray
-    """
-    true_item = test.set_index("user_id")["item_id"].to_dict()
-    eval_users = [u for u in user_vecs_df["user_id"].tolist() if u in true_item]
-    if not eval_users:
-        return {f"hit@{k}": 0.0, f"ndcg@{k}": 0.0}
+                  k: int) -> dict:
+    S = _cosine_sim(user_vecs, item_vecs)  # [U x I]
+    topk_idx = np.argpartition(-S, kth=k - 1, axis=1)[:, :k]
+    row_indices = np.arange(S.shape[0])[:, None]
+    sorted_order = np.argsort(-S[row_indices, topk_idx], axis=1)
+    topk_idx = topk_idx[row_indices, sorted_order]
 
-    U = np.vstack(user_vecs_df.set_index("user_id").loc[eval_users, "vector"].to_numpy()).astype(np.float32)
-    S = _cosine_sim(U, item_vec)  # (|eval_users| x |items|)
-    item_ids_arr = np.array(item_ids)
+    rec_items = item_ids[topk_idx]  # [U x k]
+    test_items = test["target"].to_numpy()
 
-    hits = 0
-    ndcgs = 0.0
-    for i, u in enumerate(eval_users):
-        target = true_item[u]
-        order = np.argsort(-S[i])             # descending
-        topk = item_ids_arr[order[:k]]
-        if target in topk:
-            hits += 1
-            # position in the full ranking (1-based)
-            rank = int(np.where(item_ids_arr[order] == target)[0][0]) + 1
-            ndcgs += 1.0 / math.log2(rank + 1)
+    hits = (rec_items == test_items[:, None]).any(axis=1).astype(np.float32)
 
-    n = max(1, len(eval_users))
-    return {f"hit@{k}": hits / n, f"ndcg@{k}": ndcgs / n}
-
-
-def append_metrics_csv(dataset: str,
-                       run_name: str,
-                       model: str,
-                       k: int,
-                       metrics: Dict[str, float],
-                       notes: str = "fusion") -> None:
-    """Append a row of metrics to logs/metrics.csv, creating the file if missing."""
-    from datetime import datetime
-    row = {
-        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
-        "dataset": dataset,
-        "run_name": run_name,
-        "model": model,
-        "k": k,
-        "hit": float(metrics.get(f"hit@{k}", 0.0)),
-        "ndcg": float(metrics.get(f"ndcg@{k}", 0.0)),
-        "notes": notes,
-    }
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    csv_path = LOGS_DIR / "metrics.csv"
-    write_header = not csv_path.exists()
-    import csv as _csv
-    with open(csv_path, "a", newline="") as f:
-        w = _csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header: w.writeheader()
-        w.writerow(row)
-    print(f"🧾 Appended → {csv_path}")
-
-
-# ------------------------ plotting helpers ------------------------ #
-
-def _plot_metrics(dataset: str, k: int):
-    import matplotlib.pyplot as plt
-
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    csv_path = LOGS_DIR / "metrics.csv"
-    if not csv_path.exists():
-        print("No logs/metrics.csv found; skipping plots.")
-        return
-
-    df = pd.read_csv(csv_path)
-    df = df[(df["dataset"] == dataset) & (df["k"] == k)]
-    if df.empty:
-        print(f"No matching rows in metrics.csv for dataset={dataset}, k={k}.")
-        return
-
-    plots_dir = LOGS_DIR / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    # Comparison bar chart: latest row per run_name
-    latest = df.sort_values("timestamp").groupby("run_name").tail(1)
-    latest = latest.sort_values("ndcg", ascending=False)
-
-    # Bar: NDCG@K by run_name
-    plt.figure(figsize=(10, 5))
-    plt.bar(latest["run_name"], latest["ndcg"])
-    plt.xticks(rotation=45, ha="right")
-    plt.ylabel(f"NDCG@{k}")
-    plt.title(f"{dataset}: NDCG@{k} by run")
-    plt.tight_layout()
-    comp_path = plots_dir / f"{dataset}_k{k}_comparison.png"
-    plt.savefig(comp_path, dpi=150)
-    plt.close()
-    print(f"📈 Saved comparison plot → {comp_path}")
-
-    # Trend line: timestamp vs NDCG for each run
-    plt.figure(figsize=(10, 5))
-    for name, g in df.sort_values("timestamp").groupby("run_name"):
-        plt.plot(pd.to_datetime(g["timestamp"]), g["ndcg"], marker="o", label=name)
-    plt.legend()
-    plt.ylabel(f"NDCG@{k}")
-    plt.title(f"{dataset}: NDCG@{k} over time")
-    plt.tight_layout()
-    trend_path = plots_dir / f"{dataset}_k{k}_trend.png"
-    plt.savefig(trend_path, dpi=150)
-    plt.close()
-    print(f"📈 Saved trend plot → {trend_path}")
-
-
-# ------------------------ main ------------------------ #
-
-def main(args):
-    proc = _resolve_processed_dir(args.dataset)
-
-    # 1) interactions
-    reviews_fp = proc / "reviews.parquet"
-    if not reviews_fp.exists():
-        raise FileNotFoundError(f"Missing {reviews_fp}. Run normalization first.")
-    df = pd.read_parquet(reviews_fp)
-    for col in ("user_id", "item_id", "timestamp"):
-        if col not in df.columns:
-            raise ValueError("reviews.parquet missing required columns")
-    train, test = make_loo(df)
-
-    # 2) embeddings
-    items_text = pd.read_parquet(proc / "item_text_emb.parquet")   # item_id, vector (384)
-    users_text = pd.read_parquet(proc / "user_text_emb.parquet")   # user_id, vector (384)
-    items_img  = pd.read_parquet(proc / "item_image_emb.parquet")  # item_id, vector (512)
-
-    # 3) align items + zero-fill missing images
-    item_ids: List[str] = items_text["item_id"].tolist()
-    Vt = np.vstack(items_text["vector"].to_numpy()).astype(np.float32)
-
-    img_map: Dict[str, np.ndarray] = {}
-    img_dim = None
-    for _, row in items_img.iterrows():
-        v = row["vector"]
-        if isinstance(v, np.ndarray):
-            if img_dim is None:
-                img_dim = int(v.shape[0])
-            img_map[row["item_id"]] = v.astype(np.float32)
-    if img_dim is None:
-        img_dim = 512
-
-    Vi_list = []
-    nonzero = 0
-    for iid in item_ids:
-        vec = img_map.get(iid)
-        if isinstance(vec, np.ndarray) and vec.size == img_dim:
-            Vi_list.append(vec)
-            if np.linalg.norm(vec) > 0:
-                nonzero += 1
+    # NDCG@k (binary relevance, single positive per user)
+    gains = (rec_items == test_items[:, None]).astype(np.float32)
+    ranks = np.argmax(gains, axis=1)
+    ndcg = []
+    for u, r in enumerate(ranks):
+        if gains[u].any():
+            ndcg.append(1.0 / np.log2(r + 2))
         else:
-            Vi_list.append(np.zeros((img_dim,), dtype=np.float32))
-    Vi = np.vstack(Vi_list).astype(np.float32)
+            ndcg.append(0.0)
 
-    # 4) fuse ITEM vectors
-    if args.fusion == "concat":
-        Vf_items = concat_fusion(Vt, Vi)
-        model_tag = "concat(text+image)"
-        fused_dim = Vf_items.shape[1]
+    return {f"hit@{k}": float(hits.mean()),
+            f"ndcg@{k}": float(np.mean(ndcg))}
+
+
+# ---------- main ----------
+def main(args):
+    _, proc_dir = _resolve_paths(args.dataset)
+
+    # normalized reviews (for split)
+    reviews = pd.read_parquet(proc_dir / "reviews.parquet")
+    train, test = _leave_one_out(reviews)
+
+    # user/text embeddings
+    U_text_df = pd.read_parquet(proc_dir / "user_text_emb.parquet")  # user_id, vector
+    I_text_df = pd.read_parquet(proc_dir / "item_text_emb.parquet")  # item_id, vector
+
+    # align users to evaluation subset
+    eval_users = train["user_id"].drop_duplicates().to_numpy()
+    u_map = {u: i for i, u in enumerate(U_text_df["user_id"])}
+    keep_u = [u for u in eval_users if u in u_map]
+    u_idx = np.array([u_map[u] for u in keep_u], dtype=np.int64)
+    U_text = np.stack(U_text_df.loc[u_idx, "vector"].to_numpy()).astype(np.float32)  # [U x Dt]
+
+    # align items
+    item_ids = I_text_df["item_id"].to_numpy()
+    Vt = np.stack(I_text_df["vector"].to_numpy()).astype(np.float32)  # [I x Dt]
+    Dt = Vt.shape[1]
+
+    # optional image embeddings
+    Vi = None; Di = 0
+    img_fp = proc_dir / "item_image_emb.parquet"
+    if img_fp.exists():
+        I_img = pd.read_parquet(img_fp)
+        img_map = {iid: vec for iid, vec in zip(I_img["item_id"], I_img["vector"])}
+        first = next(iter(img_map.values()), None)
+        if first is not None:
+            Di = len(first)
+            Vi = np.stack([img_map.get(i, np.zeros(Di, dtype=np.float32)) for i in item_ids]).astype(np.float32)
+
+    # optional metadata embeddings
+    Vm = None; Dm = 0
+    meta_fp = proc_dir / "item_meta_emb.parquet"
+    if meta_fp.exists():
+        I_meta = pd.read_parquet(meta_fp)
+        meta_map = {iid: vec for iid, vec in zip(I_meta["item_id"], I_meta["vector"])}
+        first = next(iter(meta_map.values()), None)
+        if first is not None:
+            Dm = len(first)
+            Vm = np.stack([meta_map.get(i, np.zeros(Dm, dtype=np.float32)) for i in item_ids]).astype(np.float32)
+
+    # fuse items; construct matching user vectors
+    fusion = args.fusion.lower()
+    if fusion == "concat":
+        Vf = concat_fusion(Vt, Vi, Vm, weights=(args.w_text, args.w_image, args.w_meta))
+        # user side to SAME concat dim: [w_t * U_text | w_i * 0 | w_m * 0]
+        if Di == 0 and Dm == 0:
+            U_fused = args.w_text * U_text
+        else:
+            zeros_i = np.zeros((U_text.shape[0], Di), dtype=np.float32) if Di > 0 else np.zeros((U_text.shape[0], 0), dtype=np.float32)
+            zeros_m = np.zeros((U_text.shape[0], Dm), dtype=np.float32) if Dm > 0 else np.zeros((U_text.shape[0], 0), dtype=np.float32)
+            U_fused = np.concatenate([args.w_text * U_text, args.w_image * zeros_i, args.w_meta * zeros_m], axis=1)
+
+    elif fusion == "weighted":
+        Vf = weighted_sum_fusion(Vt, Vi, Vm, weights=(args.w_text, args.w_image, args.w_meta))
+        target_dim = Vf.shape[1]
+        U_fused = _pad_to(args.w_text * U_text, target_dim)
+
     else:
-        Vf_items = weighted_sum_fusion(Vt, Vi, alpha=args.alpha)
-        model_tag = f"wsum(a={args.alpha})"
-        fused_dim = Vf_items.shape[1]
+        raise ValueError("fusion must be one of: concat, weighted")
 
-    # 5) build USER image vectors from TRAIN interactions (mean of item image vecs per user)
-    # Map item_id -> row index in items_text
-    item_index = {iid: idx for idx, iid in enumerate(item_ids)}
+    # evaluate on aligned users
+    test_users = test["user_id"].to_numpy()
+    keep_mask = np.isin(test_users, keep_u)
+    test_eval = test.loc[keep_mask].reset_index(drop=True)
+    U_eval = U_fused[: len(test_eval)]
 
-    user_img_vecs: Dict[str, List[np.ndarray]] = {}
-    for _, row in train.iterrows():
-        uid = row["user_id"]
-        iid = row["item_id"]
-        idx = item_index.get(iid)
-        if idx is None:
-            continue
-        v_img = Vi[idx]
-        if np.linalg.norm(v_img) == 0:
-            continue
-        user_img_vecs.setdefault(uid, []).append(v_img)
-
-    def _mean_or_zero(vecs: List[np.ndarray], d: int) -> np.ndarray:
-        if not vecs:
-            return np.zeros((d,), dtype=np.float32)
-        m = np.mean(np.stack(vecs, axis=0), axis=0).astype(np.float32)
-        n = np.linalg.norm(m) + 1e-12
-        return (m / n).astype(np.float32)
-
-    user_ids = users_text["user_id"].tolist()
-    U_text = np.vstack(users_text["vector"].to_numpy()).astype(np.float32)
-    U_img = np.vstack([_mean_or_zero(user_img_vecs.get(u, []), img_dim) for u in user_ids]).astype(np.float32)
-
-    # fuse USER vectors using same method
-    if args.fusion == "concat":
-        Uf_users = concat_fusion(U_text, U_img)
-    else:
-        Uf_users = weighted_sum_fusion(U_text, U_img, alpha=args.alpha)
-
-    # 6) evaluate users (fused) vs items (fused)
-    metrics = evaluate_topk(
-        pd.DataFrame({"user_id": user_ids, "vector": list(Uf_users)}),
-        Vf_items,
-        item_ids,
-        test,
-        k=args.k,
-    )
+    metrics = evaluate_topk(U_eval, Vf, item_ids, test_eval, k=args.k)
     print("📊 Metrics:", json.dumps(metrics, indent=2))
 
-    # 7) persist results
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    run_name = args.run_name or f"{args.dataset}_fusion_{args.fusion}"
-    with open(LOGS_DIR / f"{run_name}_eval.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-    append_metrics_csv(args.dataset, run_name, model_tag, args.k, metrics, notes="fusion")
+    # ---- logging ----
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    row = {
+        "run_name": args.run_name or "",
+        "dataset": args.dataset,
+        "fusion": fusion,
+        "w_text": args.w_text,
+        "w_image": args.w_image,
+        "w_meta": args.w_meta,
+        "k": args.k,
+        **metrics,
+    }
 
-    # 8) optional report
-    if args.report:
-        report = {
-            "dataset": args.dataset,
-            "fusion": args.fusion,
-            "alpha": args.alpha if args.fusion == "weighted" else None,
-            "k": args.k,
-            "items_total": int(len(item_ids)),
-            "image_nonzero": int(nonzero),
-            "image_coverage": float(nonzero / max(1, len(item_ids))),
-            "Dt_text": int(Vt.shape[1]),
-            "Di_image": int(Vi.shape[1]),
-            "Df_fused": int(fused_dim),
-            "metrics": metrics,
-        }
-        with open(LOGS_DIR / f"{run_name}_report.json", "w") as f:
-            json.dump(report, f, indent=2)
-        print("📝 Report:", json.dumps(report, indent=2))
+    # robust CSV append (quoting + explicit header)
+    csv_fp = logs_dir / "metrics.csv"
+    header_cols = [
+        "run_name", "dataset", "fusion",
+        "w_text", "w_image", "w_meta",
+        "k", f"hit@{args.k}", f"ndcg@{args.k}"
+    ]
+    df_row = pd.DataFrame([row], columns=[c for c in header_cols if c in row.keys()])
+    df_row.to_csv(
+        csv_fp,
+        mode="a",
+        index=False,
+        header=not csv_fp.exists(),
+        quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\n",
+    )
 
-    # 9) optional plots
+    # also dump JSON for reproducibility
+    json_fp = logs_dir / f"{args.run_name or (args.dataset + '_fusion_eval')}.json"
+    with open(json_fp, "w") as f:
+        json.dump(row, f, indent=2)
+    print(f"🧾 Appended → {csv_fp}")
+    print(f"📝 Saved → {json_fp}")
+
+    # ---- optional plots ----
     if args.plot:
-        _plot_metrics(args.dataset, args.k)
+        import matplotlib.pyplot as plt
+
+        dfm = pd.read_csv(csv_fp, engine="python").copy()
+        dset = args.dataset
+        if "dataset" in dfm.columns:
+            dfm = dfm[dfm["dataset"] == dset].copy()
+
+        # ensure str x-axis
+        if "run_name" in dfm.columns:
+            dfm["run_name"] = dfm["run_name"].fillna("").astype(str)
+        else:
+            dfm["run_name"] = ""
+
+        plots_dir = logs_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        if not dfm.empty:
+            # comparison (latest per fusion)
+            if "fusion" in dfm.columns:
+                latest = dfm.sort_values("run_name").groupby("fusion", dropna=False).tail(1)
+                if not latest.empty:
+                    fig1 = plt.figure()
+                    plt.bar(latest["fusion"].astype(str), latest[f"hit@{args.k}"])
+                    plt.title(f"Hit@{args.k} by fusion (dataset={dset})")
+                    plt.ylabel(f"Hit@{args.k}")
+                    fig1.savefig(plots_dir / f"{dset}_k{args.k}_comparison.png", bbox_inches="tight")
+                    plt.close(fig1)
+
+            # trend
+            fig2 = plt.figure()
+            plt.plot(dfm["run_name"].astype(str), dfm[f"hit@{args.k}"])
+            plt.xticks(rotation=45, ha="right")
+            plt.title(f"Hit@{args.k} trend (dataset={dset})")
+            plt.ylabel(f"Hit@{args.k}")
+            fig2.savefig(plots_dir / f"{dset}_k{args.k}_trend.png", bbox_inches="tight")
+            plt.close(fig2)
+            print(f"📈 Saved comparison plot → {plots_dir / f'{dset}_k{args.k}_comparison.png'}")
+            print(f"📈 Saved trend plot → {plots_dir / f'{dset}_k{args.k}_trend.png'}")
+        else:
+            print("ℹ️ No rows for plotting yet.")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True, help="dataset key (e.g., beauty)")
-    ap.add_argument("--fusion", choices=["concat", "weighted"], default="concat",
-                    help="concat = [text||image]; weighted = alpha*text + (1-alpha)*image (if same dims)")
-    ap.add_argument("--alpha", type=float, default=0.5, help="weight for text when fusion=weighted")
-    ap.add_argument("--k", type=int, default=10, help="K for Hit@K / NDCG@K")
-    ap.add_argument("--run_name", default=None)
-    ap.add_argument("--report", action="store_true", help="print & save coverage/dim report JSON")
-    ap.add_argument("--plot", action="store_true", help="generate comparison & trend plots from logs/metrics.csv")
+    ap.add_argument("--dataset", required=True)
+    ap.add_argument("--fusion", choices=["concat", "weighted"], default="concat")
+    ap.add_argument("--w_text", type=float, default=1.0)
+    ap.add_argument("--w_image", type=float, default=1.0)
+    ap.add_argument("--w_meta", type=float, default=0.0)
+    ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--run_name", type=str, default="")
+    ap.add_argument("--plot", action="store_true")
     args = ap.parse_args()
     main(args)
