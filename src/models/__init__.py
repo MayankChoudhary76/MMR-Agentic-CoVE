@@ -1,5 +1,2 @@
-from .text_encoder import *
-from .image_encoder import *
-from .meta_encoder import *
-from .fusion import *
+# Minimal to avoid heavy imports (e.g., open_clip) at import time
 __all__ = []

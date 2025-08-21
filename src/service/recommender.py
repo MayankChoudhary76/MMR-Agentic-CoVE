@@ -39,6 +39,11 @@ class RecommendConfig:
     k: int = 10
     fusion: str = "concat"          # "concat" or "weighted"
     weights: FusionWeights = field(default_factory=FusionWeights)
+    # alpha (optional): for "weighted", tilt text vs image.
+    #   wt_eff = weights.text  * alpha
+    #   wi_eff = weights.image * (1 - alpha)
+    # meta stays weights.meta
+    alpha: Optional[float] = None
     use_faiss: bool = False
     faiss_name: Optional[str] = None
     exclude_seen: bool = True
@@ -79,7 +84,6 @@ def _cosine_scores(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     Cosine similarity matrix between two L2‑normalized matrices.
     a: [N x D], b: [M x D]  => returns [N x M]
     """
-    # We assume inputs are already l2‑normalized. If not, normalize here.
     return a @ b.T
 
 
@@ -121,6 +125,29 @@ def _seen_items(proc: Path, user_id: str) -> set[str]:
         return set()
     df = pd.read_parquet(fp, columns=["user_id", "item_id"])
     return set(df.loc[df["user_id"].astype(str) == str(user_id), "item_id"].astype(str).tolist())
+
+
+def _pool_user_from_seen(
+    mods: Dict[str, np.ndarray],
+    id2pos: Dict[str, int],
+    proc: Path,
+    user_id: str,
+    key: str
+) -> Optional[np.ndarray]:
+    """
+    Average‑pool the user's seen items in a given modality (e.g., 'image' or 'meta').
+    Returns an L2‑normalized [1 x D] vector, zeros if no valid items, or None if modality missing.
+    """
+    if key not in mods:
+        return None
+    seen = _seen_items(proc, user_id)
+    if not seen:
+        return np.zeros((1, mods[key].shape[1]), dtype=np.float32)
+    take = [id2pos[s] for s in seen if s in id2pos]
+    if not take:
+        return np.zeros((1, mods[key].shape[1]), dtype=np.float32)
+    up = np.mean(mods[key][take, :], axis=0, keepdims=True).astype(np.float32)
+    return l2norm(up)
 
 
 # -----------------------------
@@ -205,7 +232,7 @@ def _fuse_items(
 
     elif scheme == "weighted":
         # For weighted, we simply return a concatenation but keep dims to slice later.
-        # Similarity is computed as weighted sum of cosines across slices.
+        # (We’ll compute per‑modality cosine and sum at score time.)
         parts: List[np.ndarray] = []
         if "text" in modalities:
             parts.append(modalities["text"])
@@ -252,7 +279,7 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
     if cfg.user_id not in users:
         raise ValueError(f"user_id {cfg.user_id} not found in user_text_emb.parquet")
     u_idx = users.index(cfg.user_id)
-    u = U[u_idx : u_idx + 1]  # [1 x 384], L2‑normalized already
+    u = U[u_idx : u_idx + 1]  # [1 x D], expected L2‑normalized already
 
     # --- Load items & modalities
     items_df = _read_items_table(proc)         # item details
@@ -262,7 +289,7 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
     mods = _load_item_modalities(proc)         # dict: text/image/meta -> [I x D], L2‑normalized
     Vf, dims = _fuse_items(mods, cfg.fusion, cfg.weights)
 
-    # --- Build user feature for concat, or keep u for weighted
+    # --- Build user feature for concat, or compute score‑level for weighted
     if cfg.fusion == "concat":
         parts_u: List[np.ndarray] = []
         wts: List[float] = []
@@ -270,32 +297,14 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
             parts_u.append(u)
             wts.append(cfg.weights.text)
         if "image" in mods:
-            # No user image embedding; we pool user’s seen items’ image vectors (or zeros if none).
-            # Simple approach: average image vectors of seen items.
-            seen = _seen_items(proc, cfg.user_id)
-            if seen and "image" in mods:
-                take = [id2pos[s] for s in seen if s in id2pos]
-                if take:
-                    u_img = np.mean(mods["image"][take, :], axis=0, keepdims=True).astype(np.float32)
-                    # Normalize that pooled vector
-                    u_img = l2norm(u_img)
-                else:
-                    u_img = np.zeros((1, mods["image"].shape[1]), dtype=np.float32)
-            else:
+            u_img = _pool_user_from_seen(mods, id2pos, proc, cfg.user_id, "image")
+            if u_img is None:
                 u_img = np.zeros((1, mods["image"].shape[1]), dtype=np.float32)
             parts_u.append(u_img)
             wts.append(cfg.weights.image)
         if "meta" in mods:
-            # Same idea: user meta preference from seen items' meta vectors
-            seen = _seen_items(proc, cfg.user_id)
-            if seen and "meta" in mods:
-                take = [id2pos[s] for s in seen if s in id2pos]
-                if take:
-                    u_meta = np.mean(mods["meta"][take, :], axis=0, keepdims=True).astype(np.float32)
-                    u_meta = l2norm(u_meta)
-                else:
-                    u_meta = np.zeros((1, mods["meta"].shape[1]), dtype=np.float32)
-            else:
+            u_meta = _pool_user_from_seen(mods, id2pos, proc, cfg.user_id, "meta")
+            if u_meta is None:
                 u_meta = np.zeros((1, mods["meta"].shape[1]), dtype=np.float32)
             parts_u.append(u_meta)
             wts.append(cfg.weights.meta)
@@ -316,46 +325,39 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
         else:
             sims = _cosine_scores(uf, Vf)  # [1 x I]
             scores = sims[0]
-            # Rank by cosine
             top_idx = np.argsort(-scores)
-
-            # map indices to item ids
             top_ids = [items_order[i] for i in top_idx[: cfg.k + (200 if cfg.exclude_seen else 0)]]
 
     elif cfg.fusion == "weighted":
-        # Score‑level: compute per‑modality cosines and sum with weights
+        # ----- effective weights with alpha (if provided)
+        # alpha tilts text vs image; meta remains as‑is
+        wt = cfg.weights.text
+        wi = cfg.weights.image
+        wm = cfg.weights.meta
+        if cfg.alpha is not None:
+            a = float(cfg.alpha)
+            a = max(0.0, min(1.0, a))  # clamp
+            wt = wt * a
+            wi = wi * (1.0 - a)
+
+        # ----- score‑level similarities
         sims_total = None
-        count = 0
 
-        # Always have text modality for user
-        if "text" in mods:
-            s = _cosine_scores(u, mods["text"])[0] * cfg.weights.text
+        if "text" in mods and wt != 0:
+            s = _cosine_scores(u, mods["text"])[0] * wt
             sims_total = s if sims_total is None else (sims_total + s)
-            count += 1
 
-        # Image score via pooled user image vector
-        if "image" in mods:
-            seen = _seen_items(proc, cfg.user_id)
-            if seen:
-                take = [id2pos[s] for s in seen if s in id2pos]
-                if take:
-                    u_img = np.mean(mods["image"][take, :], axis=0, keepdims=True).astype(np.float32)
-                    u_img = l2norm(u_img)
-                    s = _cosine_scores(u_img, mods["image"])[0] * cfg.weights.image
-                    sims_total = s if sims_total is None else (sims_total + s)
-                    count += 1
+        if "image" in mods and wi != 0:
+            u_img = _pool_user_from_seen(mods, id2pos, proc, cfg.user_id, "image")
+            if u_img is not None:
+                s = _cosine_scores(u_img, mods["image"])[0] * wi
+                sims_total = s if sims_total is None else (sims_total + s)
 
-        # Meta score via pooled user meta vector
-        if "meta" in mods:
-            seen = _seen_items(proc, cfg.user_id)
-            if seen:
-                take = [id2pos[s] for s in seen if s in id2pos]
-                if take:
-                    u_meta = np.mean(mods["meta"][take, :], axis=0, keepdims=True).astype(np.float32)
-                    u_meta = l2norm(u_meta)
-                    s = _cosine_scores(u_meta, mods["meta"])[0] * cfg.weights.meta
-                    sims_total = s if sims_total is None else (sims_total + s)
-                    count += 1
+        if "meta" in mods and wm != 0:
+            u_meta = _pool_user_from_seen(mods, id2pos, proc, cfg.user_id, "meta")
+            if u_meta is not None:
+                s = _cosine_scores(u_meta, mods["meta"])[0] * wm
+                sims_total = s if sims_total is None else (sims_total + s)
 
         if sims_total is None:
             raise RuntimeError("No similarities could be computed in 'weighted' fusion.")
@@ -363,6 +365,10 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
         scores = sims_total
         top_idx = np.argsort(-scores)
         top_ids = [items_order[i] for i in top_idx[: cfg.k + (200 if cfg.exclude_seen else 0)]]
+
+        # NOTE: FAISS index is built for concatenated vectors.
+        # For 'weighted' score-level fusion we currently use dense scoring only.
+        # If cfg.use_faiss is True here, we silently ignore and proceed with dense scoring.
 
     else:
         raise ValueError(f"Unknown fusion scheme: {cfg.fusion}")
@@ -407,6 +413,7 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
         "user_id": cfg.user_id,
         "fusion": cfg.fusion,
         "weights": {"text": cfg.weights.text, "image": cfg.weights.image, "meta": cfg.weights.meta},
+        "alpha": cfg.alpha,
         "k": cfg.k,
         "exclude_seen": cfg.exclude_seen,
         "use_faiss": cfg.use_faiss,
