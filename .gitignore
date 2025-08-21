@@ -1,35 +1,26 @@
+# Ignore virtual environments
+.venv/
+venv/
+ENV/
+env/
+
 # Ignore Python cache
 __pycache__/
 *.py[cod]
 
-# Ignore data files but not Python code
-src/data/*
-!src/data/*.py
-
-# Ignore model artifacts but keep Python code
-src/models/*
-!src/models/*.py
-
-# Ignore notebooks checkpoints
-.ipynb_checkpoints/
-
-# Ignore environment/config
-.env
+# Ignore system files
+.DS_Store
 *.log
 
-# Ignore compiled / binary files
-*.so
-*.dylib
-*.dll
-*.exe
+# Ignore Jupyter and Gradio cache
+.ipynb_checkpoints/
+.gradio/
 
-# Ignore common large model artifacts
-*.bin
-*.h5
-*.pt
-*.pkl
-*.ckpt
+# Ignore local data
+data/cache/
+data/processed/
 
-# Ignore venvs
-venv/
-.env/
+# Ignore build / dist
+build/
+dist/
+*.egg-info/
