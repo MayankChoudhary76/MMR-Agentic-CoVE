@@ -1,46 +1,35 @@
-cat > .gitignore <<'EOF'
-# OS
-.DS_Store
-
-# Python cache
+# Ignore Python cache
 __pycache__/
-*.pyc
+*.py[cod]
 
-# Environment & secrets
+# Ignore data files but not Python code
+src/data/*
+!src/data/*.py
+
+# Ignore model artifacts but keep Python code
+src/models/*
+!src/models/*.py
+
+# Ignore notebooks checkpoints
+.ipynb_checkpoints/
+
+# Ignore environment/config
 .env
-*.key
-*.pem
-
-# Data & model artifacts
-*.faiss
-*.bin
-*.pt
-*.h5
-*.csv
-*.jsonl
-*.jpg
-*.jpeg
-*.png
-*.gif
-*.webp
-*.bmp
-
-# Ignore only dataset folders, not code in src/data
-/data/
-/dataset/
-/data/*
-!/src/data/*.py
-
-# Outputs & notebooks
-outputs/
-notebooks/
-
-# Logs
 *.log
 
-# Local binaries
-cloudflared
+# Ignore compiled / binary files
+*.so
+*.dylib
+*.dll
+*.exe
 
-# Jupyter
-.ipynb_checkpoints/
-EOF
+# Ignore common large model artifacts
+*.bin
+*.h5
+*.pt
+*.pkl
+*.ckpt
+
+# Ignore venvs
+venv/
+.env/
