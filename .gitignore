@@ -1,26 +1,60 @@
-# Ignore virtual environments
+# ------------------------
+# Python / Virtual Envs
+# ------------------------
 .venv/
 venv/
 ENV/
 env/
-
-# Ignore Python cache
 __pycache__/
 *.py[cod]
+*.egg-info/
+*.egg
 
-# Ignore system files
-.DS_Store
+# ------------------------
+# Logs / Temp
+# ------------------------
 *.log
+*.tmp
+*.out
+.DS_Store
 
-# Ignore Jupyter and Gradio cache
+# ------------------------
+# Jupyter / Gradio
+# ------------------------
 .ipynb_checkpoints/
 .gradio/
+*.sqlite
 
-# Ignore local data
+# ------------------------
+# Local Data
+# ------------------------
 data/cache/
 data/processed/
+data/raw/
+!data/README.md   # keep a placeholder if needed
 
-# Ignore build / dist
+# ------------------------
+# FAISS Indexes / Embeddings
+# ------------------------
+*.faiss
+*.npy
+*.npz
+*.parquet
+*.h5
+
+# ------------------------
+# Build / Dist
+# ------------------------
 build/
 dist/
-*.egg-info/
+*.whl
+
+# ------------------------
+# Checkpoints / Models
+# ------------------------
+checkpoints/
+models/
+*.pt
+*.pth
+*.bin
+*.ckpt

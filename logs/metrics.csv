@@ -18,3 +18,4 @@ beauty_concat_wt1_wi1_wm0.1,beauty,concat,1.0,1.0,0.1,10,0.8055271506309509,0.28
 beauty_concat_wt1_wi1_wm0.2,beauty,concat,1.0,1.0,0.2,10,0.8055271506309509,0.290361211638769
 beauty_concat_wt1_wi1_wm0.3,beauty,concat,1.0,1.0,0.3,10,0.8055271506309509,0.28559587035443146
 beauty_concat_wt1_wi1_wm0.4,beauty,concat,1.0,1.0,0.4,10,0.8055271506309509,0.2978156895276733
+2025-08-23T23:41:53,beauty,beauty_text_emb,sentence-transformers/all-MiniLM-L6-v2,10,0.4949186991869919,0.29769705658879625,

@@ -8,6 +8,8 @@ import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from pathlib import Path
+import pandas as pd
 
 from src.utils.paths import get_processed_path
 from src.models.fusion import l2norm  # keep using the shared l2norm
@@ -40,9 +42,6 @@ class RecommendConfig:
     fusion: str = "concat"          # "concat" or "weighted"
     weights: FusionWeights = field(default_factory=FusionWeights)
     # alpha (optional): for "weighted", tilt text vs image.
-    #   wt_eff = weights.text  * alpha
-    #   wi_eff = weights.image * (1 - alpha)
-    # meta stays weights.meta
     alpha: Optional[float] = None
     use_faiss: bool = False
     faiss_name: Optional[str] = None
@@ -231,8 +230,6 @@ def _fuse_items(
         return fused, dims
 
     elif scheme == "weighted":
-        # For weighted, we simply return a concatenation but keep dims to slice later.
-        # (We’ll compute per‑modality cosine and sum at score time.)
         parts: List[np.ndarray] = []
         if "text" in modalities:
             parts.append(modalities["text"])
@@ -321,7 +318,8 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
                 idx_dir / f"items_{cfg.faiss_name}.npy",
                 uf, cfg.k + (200 if cfg.exclude_seen else 0)
             )
-            scores = D  # already inner products / sims saved by FAISS builder
+            # If FAISS index was built with IP on L2norm, distances are sims already.
+            scores = D
         else:
             sims = _cosine_scores(uf, Vf)  # [1 x I]
             scores = sims[0]
@@ -330,7 +328,6 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
 
     elif cfg.fusion == "weighted":
         # ----- effective weights with alpha (if provided)
-        # alpha tilts text vs image; meta remains as‑is
         wt = cfg.weights.text
         wi = cfg.weights.image
         wm = cfg.weights.meta
@@ -368,7 +365,6 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
 
         # NOTE: FAISS index is built for concatenated vectors.
         # For 'weighted' score-level fusion we currently use dense scoring only.
-        # If cfg.use_faiss is True here, we silently ignore and proceed with dense scoring.
 
     else:
         raise ValueError(f"Unknown fusion scheme: {cfg.fusion}")
@@ -420,3 +416,51 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
         "faiss_name": cfg.faiss_name,
         "recommendations": recs,
     }
+
+def _load_item_metadata(proc: Path) -> pd.DataFrame:
+    """
+    Load item metadata (brand, price, categories, image_url) for enrichment.
+    Prefers items_with_meta.parquet; falls back to joined.parquet (dedup by item_id).
+    Returns a DataFrame with columns: item_id, brand, price, categories, image_url
+    """
+    # 1) Preferred file
+    fp1 = proc / "items_with_meta.parquet"
+    if fp1.exists():
+        df = pd.read_parquet(fp1)
+    else:
+        # 2) Fallback to joined.parquet and deduplicate per item_id
+        fp2 = proc / "joined.parquet"
+        if not fp2.exists():
+            # Nothing to enrich with; return empty df with expected columns
+            return pd.DataFrame(columns=["item_id", "brand", "price", "categories", "image_url"])
+        j = pd.read_parquet(fp2)
+        cols = ["item_id", "brand", "price", "categories", "image_url"]
+        cols = [c for c in cols if c in j.columns]
+        if "item_id" not in cols:
+            return pd.DataFrame(columns=["item_id", "brand", "price", "categories", "image_url"])
+        df = j[cols].dropna(subset=["item_id"]).drop_duplicates(subset=["item_id"])
+
+    # Normalize dtypes/values for JSON safety
+    if "categories" in df.columns:
+        # convert numpy object arrays (e.g., array(['Beauty & Personal Care'], dtype=object)) to plain lists/strings
+        def _fix_cat(v):
+            try:
+                if isinstance(v, (list, tuple)):
+                    return list(v)
+                # numpy array → list
+                import numpy as np
+                if isinstance(v, np.ndarray):
+                    return v.tolist()
+            except Exception:
+                pass
+            return v
+        df["categories"] = df["categories"].map(_fix_cat)
+
+    # Ensure the minimal column set exists
+    for col in ["brand", "price", "categories", "image_url"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # item_id must be string for safe joins
+    df["item_id"] = df["item_id"].astype(str)
+    return df[["item_id", "brand", "price", "categories", "image_url"]]
