@@ -5,12 +5,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# You can use CPU FAISS everywhere; it’s fine for this dataset size
-# If faiss isn't installed, run:  pip install faiss-cpu
+# If FAISS isn't installed:  pip install faiss-cpu
 import faiss
 
 from src.data.registry import get_paths
-from src.models.fusion import concat_fusion, weighted_sum_fusion
+from src.models.fusion import concat_fusion  # FAISS is used with concat in online path
 
 
 def _resolve_paths(dataset: str):
@@ -29,7 +28,7 @@ def _resolve_paths(dataset: str):
 def _load_vectors(proc_dir: Path):
     # Text (required)
     text_df = pd.read_parquet(proc_dir / "item_text_emb.parquet")
-    item_ids = text_df["item_id"].to_numpy()
+    item_ids = text_df["item_id"].astype(str).to_numpy()
     Vt = np.stack(text_df["vector"].to_numpy()).astype(np.float32)
 
     # Image (optional)
@@ -37,7 +36,7 @@ def _load_vectors(proc_dir: Path):
     img_fp = proc_dir / "item_image_emb.parquet"
     if img_fp.exists():
         img_df = pd.read_parquet(img_fp)
-        img_map = {iid: vec for iid, vec in zip(img_df["item_id"], img_df["vector"])}
+        img_map = {str(iid): vec for iid, vec in zip(img_df["item_id"].astype(str), img_df["vector"])}
         Di = len(next(iter(img_map.values())))
         Vi = np.stack([img_map.get(i, np.zeros(Di, dtype=np.float32)) for i in item_ids]).astype(np.float32)
 
@@ -46,7 +45,7 @@ def _load_vectors(proc_dir: Path):
     meta_fp = proc_dir / "item_meta_emb.parquet"
     if meta_fp.exists():
         meta_df = pd.read_parquet(meta_fp)
-        meta_map = {iid: vec for iid, vec in zip(meta_df["item_id"], meta_df["vector"])}
+        meta_map = {str(iid): vec for iid, vec in zip(meta_df["item_id"].astype(str), meta_df["vector"])}
         Dm = len(next(iter(meta_map.values())))
         Vm = np.stack([meta_map.get(i, np.zeros(Dm, dtype=np.float32)) for i in item_ids]).astype(np.float32)
 
@@ -59,7 +58,7 @@ def _l2norm(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 
 def build_index(V: np.ndarray):
-    # Cosine similarity via inner product on L2-normalized vectors
+    # Cosine via inner product on L2-normalized vectors
     Vn = _l2norm(V.astype(np.float32, copy=False))
     index = faiss.IndexFlatIP(Vn.shape[1])
     index.add(Vn)
@@ -67,13 +66,15 @@ def build_index(V: np.ndarray):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True)
+    ap = argparse.ArgumentParser(description="Build FAISS index for a dataset (concat fusion).")
+    ap.add_argument("--dataset", required=True, help="Dataset key, e.g. beauty")
+    # keep fusion arg for CLI parity, but we only honor concat for FAISS (matches online use)
     ap.add_argument("--fusion", choices=["concat", "weighted"], default="concat")
     ap.add_argument("--w_text", type=float, default=1.0)
     ap.add_argument("--w_image", type=float, default=1.0)
     ap.add_argument("--w_meta", type=float, default=0.0)
-    ap.add_argument("--out_name", type=str, default="")
+    ap.add_argument("--variant", type=str, default="concat_best",
+                    help="Name part after <dataset>_ (e.g. concat_best → items_<dataset>_concat_best.faiss)")
     args = ap.parse_args()
 
     _, proc_dir = _resolve_paths(args.dataset)
@@ -82,23 +83,28 @@ def main():
 
     item_ids, Vt, Vi, Vm = _load_vectors(proc_dir)
 
-    if args.fusion == "concat":
-        V = concat_fusion(Vt, Vi, Vm, weights=(args.w_text, args.w_image, args.w_meta))
-    else:
-        V = weighted_sum_fusion(Vt, Vi, Vm, weights=(args.w_text, args.w_image, args.w_meta))
+    if args.fusion != "concat":
+        print("[warn] FAISS index is used by the online recommender only for 'concat'. "
+              "Proceeding with concat fusion to keep things consistent.")
+
+    # Build concat fused matrix with weights (same as online concat path)
+    V = concat_fusion(Vt, Vi, Vm, weights=(args.w_text, args.w_image, args.w_meta))
 
     index = build_index(V)
 
-    name = args.out_name or f"{args.fusion}_wt{args.w_text}_wi{args.w_image}_wm{args.w_meta}"
-    faiss_fp = out_dir / f"items_{name}.faiss"
-    ids_fp = out_dir / f"items_{name}.npy"
+    # Naming: items_<dataset>_<variant>.{faiss,npy}
+    base = f"items_{args.dataset}_{args.variant}"
+    faiss_fp = out_dir / f"{base}.faiss"
+    ids_fp   = out_dir / f"{base}.npy"
 
     faiss.write_index(index, str(faiss_fp))
-    np.save(ids_fp, item_ids)
+    # Save ids with dtype=object to be robust
+    np.save(ids_fp, np.array(item_ids, dtype=object))
 
     print(f"✅ Built FAISS index: {faiss_fp}")
     print(f"✅ Saved item id mapping: {ids_fp}")
     print(f"Items: {len(item_ids)} | Dim: {V.shape[1]}")
+    print("Tip: In the UI/API, use faiss_name =", f"{args.dataset}_{args.variant!s}")
 
 if __name__ == "__main__":
     main()

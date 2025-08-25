@@ -1,0 +1,60 @@
+# tests/test_chat_agent.py
+import numpy as np
+import pandas as pd
+
+from src.agents.chat_agent import ChatAgent, ChatTurn
+
+class DummyModel:
+    """Returns a unit vector pointing along x for any query."""
+    def encode(self, texts, convert_to_numpy=True, normalize_embeddings=True):
+        vec = np.array([[1.0, 0.0]], dtype=np.float32)
+        return vec if convert_to_numpy else vec.tolist()
+
+def make_df():
+    # Two items with tiny embeddings + metadata
+    # A is aligned with x-axis -> will be most similar to DummyModel
+    return pd.DataFrame(
+        {
+            "item_id":   ["A", "B"],
+            "brand":     ["foo", "bar"],
+            "price":     [10.0, 30.0],
+            "categories":["Beauty", "Beauty"],
+            "image_url": ["http://a", "http://b"],
+            "emb":       [np.array([1.0, 0.0], dtype=np.float32),
+                          np.array([0.0, 1.0], dtype=np.float32)],
+        }
+    )
+
+def test_slot_filling_and_filters(monkeypatch):
+    agent = ChatAgent(default_dataset="beauty")
+
+    # stub model + table loaders
+    monkeypatch.setattr(agent, "_load_text_model", lambda: DummyModel())
+    monkeypatch.setattr(agent, "_load_items_table", lambda ds: make_df())
+
+    # user asks with constraints
+    history = [ChatTurn(role="user",
+                        content="dataset: beauty top-3 brand foo under $20 gentle shampoo")]
+    res = agent.reply(history)
+
+    # reply text should reflect slots; top item should be A; price filter applied
+    assert "dataset=beauty" in res.reply
+    assert "k=3" in res.reply
+    assert any("brand~foo" in t for t in [res.reply])
+    assert any("price<=" in t for t in [res.reply])
+
+    assert len(res.items) >= 1
+    assert res.items[0]["item_id"] == "A"
+    assert res.items[0]["price"] <= 20.0
+
+def test_rank_order_without_filters(monkeypatch):
+    agent = ChatAgent(default_dataset="beauty")
+    monkeypatch.setattr(agent, "_load_text_model", lambda: DummyModel())
+    monkeypatch.setattr(agent, "_load_items_table", lambda ds: make_df())
+    agent.ctx.k = 2
+
+    res = agent.reply([ChatTurn(role="user", content="show me something nice")])
+
+    # with DummyModel, A (x-axis) must rank above B
+    assert [it["item_id"] for it in res.items] == ["A", "B"]
+    assert res.items[0]["score"] >= res.items[1]["score"]

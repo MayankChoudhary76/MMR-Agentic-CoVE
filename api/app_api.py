@@ -2,345 +2,540 @@
 from __future__ import annotations
 
 import os
-import sys
+import time
+import inspect
+import ast
 import math
-from typing import Optional, Literal, Dict, Any, List
+import re
+import traceback
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+import pandas as pd
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# -----------------------------------------------------------------------------
-# Make sure we can import from src/*
-# -----------------------------------------------------------------------------
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+from src.utils.paths import get_processed_path
+from src.service.recommender import recommend_for_user, RecommendConfig, FusionWeights
+from src.agents.chat_agent import ChatAgent, ChatAgentConfig
 
-# -----------------------------------------------------------------------------
-# Service import
-# -----------------------------------------------------------------------------
-try:
-    from src.service.recommender import recommend_for_user, RecommendConfig, FusionWeights
-except Exception as e:
-    raise RuntimeError(
-        "Could not import src.service.recommender.recommend_for_user. "
-        "Make sure src/service/recommender.py exists and exports recommend_for_user(...)."
-    ) from e
+# Instantiate the chat agent used by /chat_recommend
+CHAT_AGENT = ChatAgent(ChatAgentConfig())
 
-
-# -----------------------------------------------------------------------------
-# Request / Response Schemas
-# -----------------------------------------------------------------------------
-class RecRequest(BaseModel):
-    dataset: str = Field(default="beauty", description="Dataset key (e.g., 'beauty').")
-    user_id: str = Field(description="User ID as seen in processed reviews.")
-    k: int = Field(default=10, ge=1, le=1000)
-    fusion: Literal["concat", "weighted"] = "concat"
-
-    # fusion weights
-    w_text: float = 1.0
-    w_image: float = 1.0
-    w_meta: float = 0.0  # set >0 if you built meta embeddings
-
-    # retrieval
-    use_faiss: bool = True
-    faiss_name: Optional[str] = Field(
-        default=None,
-        description="Name used when saving the FAISS index (e.g., 'beauty_concat_best')."
-    )
-    exclude_seen: bool = True
-
-
-class RecItem(BaseModel):
-    item_id: str
-    score: float
-    brand: Optional[str] = None
-    price: Optional[float] = None
-    categories: Optional[str] = None
-    image_url: Optional[str] = None
-
-
-class RecResponse(BaseModel):
-    dataset: str
-    user_id: str
-    fusion: Literal["concat", "weighted"]
-    weights: Dict[str, float]
-    k: int
-    exclude_seen: bool
-    use_faiss: bool
-    faiss_name: Optional[str] = None
-    recommendations: List[RecItem]
-
-
-# -----------------------------------------------------------------------------
-# Helpers to make JSON safe (avoid NaN/Inf leaking to JSON)
-# -----------------------------------------------------------------------------
-def _clean_float(x) -> Optional[float]:
+def _agent_introspection():
     try:
-        f = float(x)
+        fn = getattr(ChatAgent, "reply", None)
+        code = getattr(fn, "__code__", None)
+        file_path = getattr(code, "co_filename", None)
+        mtime = None
+        if file_path and os.path.exists(file_path):
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(file_path)))
+        sig = str(inspect.signature(ChatAgent.reply)) if hasattr(ChatAgent, "reply") else "N/A"
+        return {
+            "class": str(CHAT_AGENT.__class__),
+            "module": ChatAgent.__module__,
+            "file": file_path,
+            "file_mtime": mtime,
+            "reply_signature": sig,
+            "has_debug_attr_on_instance": hasattr(CHAT_AGENT, "debug"),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    
+# ---------------- Helpers ----------------
+def _parse_listlike_string(s: str) -> List[str]:
+    """
+    Parse strings like "['A','B']" or '["A"]' into ['A','B']; otherwise produce a best-effort list.
+    """
+    if not isinstance(s, str):
+        return []
+    t = s.strip()
+    if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
+        try:
+            val = ast.literal_eval(t)
+            if isinstance(val, (list, tuple, set)):
+                return [str(x).strip() for x in val if x is not None and str(x).strip()]
+        except Exception:
+            pass
+    # Fallback: split on common delimiters or return scalar
+    if re.search(r"[>|,/;]+", t):
+        return [p.strip() for p in re.split(r"[>|,/;]+", t) if p.strip()]
+    return [t] if t else []
+
+def _enrich_with_catalog(dataset: str, recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fill missing fields (title, rank, image_url, price, categories) from items_catalog.parquet."""
+    try:
+        proc = get_processed_path(dataset)
+        cat_fp = proc / "items_catalog.parquet"
+        if not cat_fp.exists() or not recs:
+            return recs
+        df = pd.read_parquet(cat_fp)
+        df = df[["item_id","title","rank","image_url","price","categories"]].copy()
+        cat = {str(r.item_id): r for r in df.itertuples(index=False)}
+        out = []
+        for r in recs:
+            iid = str(r.get("item_id",""))
+            add = cat.get(iid)
+            if add:
+                # fill if missing
+                r.setdefault("title", getattr(add,"title"))
+                r.setdefault("rank",  None if pd.isna(getattr(add,"rank")) else int(getattr(add,"rank")))
+                r.setdefault("image_url", getattr(add,"image_url"))
+                if r.get("price") in (None,"",0) and pd.notna(getattr(add,"price")):
+                    r["price"] = float(getattr(add,"price"))
+                if not r.get("categories"):
+                    r["categories"] = getattr(add,"categories")
+            out.append(r)
+        return out
+    except Exception:
+        return recs
+    
+# --- simple parsers for budget + keyword ---
+_PRICE_RE = re.compile(r"\$?\s*([0-9]+(?:\.[0-9]+)?)")
+
+def _parse_price_cap(text: str) -> Optional[float]:
+    m = _PRICE_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
     except Exception:
         return None
-    if math.isnan(f) or math.isinf(f):
-        return None
-    return f
 
-def _clean_str(x) -> Optional[str]:
-    if x is None:
-        return None
-    s = str(x)
-    return s if s.lower() != "nan" else None
-
-def _clean_weights(w: Dict[str, Any]) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    for k, v in (w or {}).items():
-        cf = _clean_float(v)
-        if cf is None:
+_STOPWORDS = {"under","below","less","than","max","upto","up","to","recommend","something","for","me","need","budget","cheap","please","soap","shampoos"}
+def _parse_keyword(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    t = _PRICE_RE.sub(" ", t)
+    for w in re.findall(r"[a-z][a-z0-9\-]+", t):
+        if w in _STOPWORDS:
             continue
-        out[k] = cf
-    return out
+        return w
+    return None
+
+def _normalize_categories_in_place(items):
+    """
+    Force each item's 'categories' into a clean List[str].
+    Handles:
+      - None
+      - "['A','B']"  (stringified list)
+      - ["['A','B']"] (list holding a stringified list)
+      - list/tuple/set of strings and/or nested containers
+    """
+    def _as_list_from_string(s: str) -> List[str]:
+        s = (s or "").strip()
+        if not s:
+            return []
+        # Try to parse a literal list/tuple first
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, (list, tuple, set)):
+                    return [str(x).strip() for x in parsed if x is not None and str(x).strip()]
+            except Exception:
+                pass
+        # Fallback: treat as a single label
+        return [s]
+
+    for r in items or []:
+        cats = r.get("categories")
+        out: List[str] = []
+
+        if cats is None:
+            out = []
+        elif isinstance(cats, str):
+            out = _as_list_from_string(cats)
+        elif isinstance(cats, (list, tuple, set)):
+            tmp: List[str] = []
+            for c in cats:
+                if c is None:
+                    continue
+                if isinstance(c, str):
+                    tmp.extend(_as_list_from_string(c))
+                elif isinstance(c, (list, tuple, set)):
+                    for y in c:
+                        if y is None:
+                            continue
+                        if isinstance(y, str):
+                            tmp.extend(_as_list_from_string(y))
+                        else:
+                            ys = str(y).strip()
+                            if ys:
+                                tmp.append(ys)
+                else:
+                    s = str(c).strip()
+                    if s:
+                        tmp.append(s)
+            # dedupe while preserving order
+            seen = set()
+            out = []
+            for x in tmp:
+                if x and x not in seen:
+                    seen.add(x)
+                    out.append(x)
+        else:
+            s = str(cats).strip()
+            out = [s] if s else []
+
+        r["categories"] = out
+
+def _to_jsonable(obj: Any):
+    """
+    Convert numpy/pandas and other non‑JSON‑serializable objects to plain Python types.
+    Replace NaN/Inf with None to satisfy strict JSON.
+    """
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None  # type: ignore
+
+    # primitives
+    if obj is None or isinstance(obj, (str, bool)):
+        return obj
+
+    if isinstance(obj, (int, float)):
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return None
+        return obj
+
+    # numpy scalars
+    if np is not None:
+        if isinstance(obj, getattr(np, "integer", ())):
+            return int(obj)
+        if isinstance(obj, getattr(np, "floating", ())):
+            f = float(obj)
+            return None if not math.isfinite(f) else f
+        if isinstance(obj, getattr(np, "bool_", ())):
+            return bool(obj)
+
+    # containers
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+
+    # pandas
+    if isinstance(obj, pd.Series):
+        return {str(k): _to_jsonable(v) for k, v in obj.to_dict().items()}
+    if isinstance(obj, pd.DataFrame):
+        return [_to_jsonable(r) for r in obj.to_dict(orient="records")]
+
+    # namedtuple / objects with _asdict
+    if hasattr(obj, "_asdict"):
+        return {str(k): _to_jsonable(v) for k, v in obj._asdict().items()}
+
+    # last resort
+    return str(obj)
 
 
-# -----------------------------------------------------------------------------
-# FastAPI app (works locally and behind Cloudflare Quick Tunnels)
-# -----------------------------------------------------------------------------
-app = FastAPI(
-    title="MMR-Agentic-CoVE Recommender API",
-    description="Dataset-aware recommendation endpoint (text/image/meta + FAISS).",
-    version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
+# ---------------- FastAPI app ----------------
+app = FastAPI(title="MMR-Agentic-CoVE API", version="1.0.3")
 
-# CORS: open so the UI served from a different origin (e.g., trycloudflare.com)
-# can call this API without issues.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # fine for demo; restrict in production
+    allow_origins=["*"],  # adjust for prod
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# -----------------------------------------------------------------------------
-# Global exception handlers → clean 4xx/5xx JSON
-# -----------------------------------------------------------------------------
-@app.exception_handler(ValueError)
-async def value_error_handler(request: Request, exc: ValueError):
-    return JSONResponse(status_code=400, content={"detail": str(exc)})
+# ---------------- Schemas ----------------
+class RecommendIn(BaseModel):
+    dataset: str
+    user_id: str
+    k: int = 10
+    fusion: str = Field(default="concat", pattern="^(concat|weighted)$")
+    w_text: float = 1.0
+    w_image: float = 1.0
+    w_meta: float = 0.0
+    use_faiss: bool = False
+    faiss_name: Optional[str] = None
+    exclude_seen: bool = True
+    alpha: Optional[float] = None
 
-@app.exception_handler(FileNotFoundError)
-async def file_not_found_handler(request: Request, exc: FileNotFoundError):
-    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
 
 
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
+class ChatIn(BaseModel):
+    messages: List[ChatMessage]
+    dataset: Optional[str] = None
+    user_id: Optional[str] = None
+    k: int = 5
+    # These are present in schema for future compatibility, but the agent
+    # may or may not accept them; we filter before calling reply().
+    use_faiss: bool = False
+    faiss_name: Optional[str] = None
 
-# Optional extra alias some monitors/tools use
-@app.get("/health")
-def health_alias():
-    return {"status": "ok"}
 
-@app.post("/recommend", response_model=RecResponse)
-def recommend(req: RecRequest):
-    cfg = RecommendConfig(
-        dataset=req.dataset,
-        user_id=req.user_id,
-        k=req.k,
-        fusion=req.fusion,
-        weights=FusionWeights(text=req.w_text, image=req.w_image, meta=req.w_meta),
-        use_faiss=req.use_faiss,
-        faiss_name=req.faiss_name,
-        exclude_seen=req.exclude_seen,
-    )
-
+# ---------------- Endpoints ----------------
+@app.get("/users")
+def list_users(dataset: str = Query(..., description="Dataset name, e.g., 'beauty'")):
     try:
-        result: Dict[str, Any] = recommend_for_user(cfg)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
-
-    items: List[RecItem] = []
-    for it in result.get("recommendations", []):
-        items.append(
-            RecItem(
-                item_id=_clean_str(it.get("item_id")) or "",
-                score=_clean_float(it.get("score")) or 0.0,
-                brand=_clean_str(it.get("brand")),
-                price=_clean_float(it.get("price")),
-                categories=_clean_str(it.get("categories")),
-                image_url=_clean_str(it.get("image_url")),
+        proc = get_processed_path(dataset)
+        fp_ids = proc / "user_text_emb.parquet"
+        if not fp_ids.exists():
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Unknown dataset '{dataset}' or missing '{fp_ids.name}' in {proc}."},
             )
+
+        # load ids
+        df_ids = pd.read_parquet(fp_ids, columns=["user_id"])
+        users = sorted(df_ids["user_id"].astype(str).unique().tolist())
+
+        # optional names
+        names_fp = proc / "user_map.parquet"
+        names = {}
+        if names_fp.exists():
+            df_names = pd.read_parquet(names_fp)
+            if "user_id" in df_names.columns and "user_name" in df_names.columns:
+                for r in df_names.itertuples(index=False):
+                    uid = str(getattr(r, "user_id"))
+                    nm  = getattr(r, "user_name")
+                    if uid and uid not in names and pd.notna(nm):
+                        names[uid] = str(nm)
+        # Try to include optional user name map if present (built by build_catalog.py)
+        names = {}
+        try:
+            umap_fp = proc / "user_map.parquet"
+            if umap_fp.exists():
+                umap = pd.read_parquet(umap_fp)
+                if {"user_id", "user_name"} <= set(umap.columns):
+                    umap["user_id"] = umap["user_id"].astype(str)
+                    umap = umap.dropna(subset=["user_id"]).drop_duplicates("user_id")
+                    names = dict(zip(umap["user_id"], umap["user_name"].fillna("").astype(str)))
+        except Exception:
+            names = {}
+            
+        return {"dataset": dataset, "count": len(users), "users": users, "names": names}
+
+    except Exception as e:
+        tb = traceback.format_exc(limit=2)
+        return JSONResponse(status_code=500, content={"detail": f"/users failed: {e}", "traceback": tb})
+    
+@app.get("/agentz")
+def agentz():
+    return _agent_introspection()
+
+@app.post("/recommend")
+def make_recommend(body: RecommendIn):
+    try:
+        # Preflight dataset/file check (mirrors /users)
+        proc = get_processed_path(body.dataset)
+        user_fp = proc / "user_text_emb.parquet"
+        if not user_fp.exists():
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": (
+                        f"Unknown dataset '{body.dataset}' or missing required file "
+                        f"'{user_fp.name}' in {proc}."
+                    )
+                },
+            )
+
+        cfg = RecommendConfig(
+            dataset=body.dataset,
+            user_id=str(body.user_id),
+            k=int(body.k),
+            fusion=body.fusion,
+            weights=FusionWeights(text=body.w_text, image=body.w_image, meta=body.w_meta),
+            alpha=body.alpha,
+            use_faiss=body.use_faiss,
+            faiss_name=body.faiss_name,
+            exclude_seen=body.exclude_seen,
         )
 
-    return RecResponse(
-        dataset=_clean_str(result.get("dataset")) or req.dataset,
-        user_id=_clean_str(result.get("user_id")) or req.user_id,
-        fusion=result.get("fusion", req.fusion),
-        weights=_clean_weights(result.get("weights")),
-        k=int(result.get("k", req.k)),
-        exclude_seen=bool(result.get("exclude_seen", req.exclude_seen)),
-        use_faiss=bool(result.get("use_faiss", req.use_faiss)),
-        faiss_name=_clean_str(result.get("faiss_name")),
-        recommendations=items,
-    )
+        # Pre-check FAISS index to produce clean 400s
+        if cfg.use_faiss:
+            if not cfg.faiss_name:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "detail": (
+                            "FAISS is enabled but 'faiss_name' is missing. "
+                            "Provide faiss_name or set use_faiss=false."
+                        )
+                    },
+                )
+            index_path = proc / "index" / f"items_{cfg.faiss_name}.faiss"
+            if not index_path.exists():
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "detail": f"FAISS index not found: {index_path}. "
+                                  f"Build it or set use_faiss=false."
+                    },
+                )
 
+        out = recommend_for_user(cfg)
+        # Robust cap so we never exceed available results
+        out_recs = (out.get("recommendations") or [])[: int(cfg.k)]
+        out_recs = _enrich_with_catalog(body.dataset, out_recs)
+        out["recommendations"] = _to_jsonable(out_recs)
+        return JSONResponse(content=out)
 
-# -----------------------------------------------------------------------------
-# Minimal HTML home for quick manual testing (works behind Cloudflare)
-# -----------------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>MMR-Agentic-CoVE | API Demo</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <style>
-    body{font-family:system-ui,Arial,sans-serif;margin:20px;max-width:980px}
-    label{display:block;margin:8px 0 4px}
-    input,select{width:100%;padding:8px;font-size:14px}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    button{margin-top:14px;padding:10px 14px;font-size:14px;cursor:pointer}
-    .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-top:16px}
-    .card{border:1px solid #ddd;border-radius:10px;padding:10px}
-    .score{opacity:.7;font-size:12px}
-    img{max-width:100%;border-radius:8px}
-    .hint{margin-top:4px;color:#555;font-size:12px}
-    pre{white-space:pre-wrap}
-  </style>
-</head>
-<body>
-  <h2>Multimodal Recommender (Beauty)</h2>
-  <div class="hint">
-    Behind a reverse proxy (e.g., Cloudflare Quick Tunnel) this page and
-    <code>/recommend</code> share the same origin, so no extra config is needed.
-  </div>
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Dataset '{body.dataset}' not found or incomplete."},
+        )
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"/recommend failed: {e}"},
+        )
+    except Exception as e:
+        tb = traceback.format_exc(limit=5)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"/recommend failed: {e}", "traceback": tb},
+        )
 
-  <div class="row">
-    <div>
-      <label>Dataset</label>
-      <input id="dataset" value="beauty"/>
-    </div>
-    <div>
-      <label>User ID</label>
-      <input id="user_id" value="A3CIUOJXQ5VDQ2"/>
-    </div>
-    <div>
-      <label>Top-K</label>
-      <input id="k" type="number" value="10" min="1" max="50"/>
-    </div>
-    <div>
-      <label>Fusion</label>
-      <select id="fusion">
-        <option value="concat" selected>concat</option>
-        <option value="weighted">weighted</option>
-      </select>
-    </div>
-    <div>
-      <label>Weight: text</label>
-      <input id="w_text" type="number" step="0.1" value="1.0"/>
-    </div>
-    <div>
-      <label>Weight: image</label>
-      <input id="w_image" type="number" step="0.1" value="1.0"/>
-    </div>
-    <div>
-      <label>Weight: meta</label>
-      <input id="w_meta" type="number" step="0.1" value="0.4"/>
-    </div>
-    <div>
-      <label>Use FAISS</label>
-      <select id="use_faiss">
-        <option value="true">true</option>
-        <option value="false" selected>false</option>
-      </select>
-    </div>
-    <div>
-      <label>FAISS name</label>
-      <input id="faiss_name" value="beauty_concat_best"/>
-      <div class="hint">Used only when Use FAISS = true</div>
-    </div>
-    <div>
-      <label>Exclude seen</label>
-      <select id="exclude_seen">
-        <option value="true" selected>true</option>
-        <option value="false">false</option>
-      </select>
-    </div>
-  </div>
-  <button onclick="run()">Get Recommendations</button>
-  <pre id="status"></pre>
-  <div id="cards" class="cards"></div>
+@app.post("/chat_recommend")
+def chat_recommend(body: ChatIn):
+    # Tolerant parse of messages (works with Pydantic v1/v2 and plain dicts)
+    msgs: List[Dict[str, str]] = []
+    for m in body.messages:
+        if isinstance(m, dict):
+            msgs.append({"role": m.get("role"), "content": m.get("content")})
+        else:
+            d = m.model_dump() if hasattr(m, "model_dump") else m.dict()
+            msgs.append({"role": d.get("role"), "content": d.get("content")})
 
-<script>
-async function run(){
-  const payload = {
-    dataset: document.getElementById('dataset').value,
-    user_id: document.getElementById('user_id').value,
-    k: Number(document.getElementById('k').value),
-    fusion: document.getElementById('fusion').value,
-    w_text: Number(document.getElementById('w_text').value),
-    w_image: Number(document.getElementById('w_image').value),
-    w_meta: Number(document.getElementById('w_meta').value),
-    use_faiss: document.getElementById('use_faiss').value === 'true',
-    exclude_seen: document.getElementById('exclude_seen').value === 'true'
-  };
-  if (payload.use_faiss) payload.faiss_name = document.getElementById('faiss_name').value;
+    try:
+        # === 1) Ask the agent (if present) ===
+        out: Dict[str, Any] = {"reply": "", "recommendations": []}
+        recs: List[Dict[str, Any]] = []
 
-  const status = document.getElementById('status');
-  const cards = document.getElementById('cards');
-  status.textContent = 'Calling /recommend...';
-  cards.innerHTML = '';
-  try{
-    const res = await fetch('/recommend', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
-    });
-    const body = await res.json();
-    if(!res.ok){
-      status.textContent = 'Error: ' + (body.detail || res.status);
-      return;
+        if hasattr(CHAT_AGENT, "reply"):
+            candidate_kwargs = {
+                "messages": msgs,
+                "dataset": body.dataset,
+                "user_id": body.user_id,
+                "k": body.k,
+                # don't pass use_faiss/faiss_name unless agent supports them
+                "use_faiss": body.use_faiss,
+                "faiss_name": body.faiss_name,
+            }
+            sig = inspect.signature(CHAT_AGENT.reply)
+            allowed = set(sig.parameters.keys())
+            safe_kwargs = {k: v for k, v in candidate_kwargs.items() if k in allowed}
+
+            agent_out = CHAT_AGENT.reply(**safe_kwargs)
+            if isinstance(agent_out, dict):
+                out.update(agent_out)
+                recs = agent_out.get("recommendations") or []
+            else:
+                out["reply"] = str(agent_out) if agent_out is not None else ""
+
+        # ensure list[dict]
+        recs = [dict(r) if not isinstance(r, dict) else r for r in (recs or [])]
+
+        # === 2) If agent returned nothing, fallback to recommender ===
+        if not recs:
+            # make a safe RecommendConfig; default to concat/no-faiss
+            cfg = RecommendConfig(
+                dataset=body.dataset or "beauty",
+                user_id=str(body.user_id or ""),
+                k=int(body.k or 5),
+                fusion="concat",
+                weights=FusionWeights(text=1.0, image=1.0, meta=0.4),
+                alpha=None,
+                use_faiss=False,
+                faiss_name=None,
+                exclude_seen=True,
+            )
+            try:
+                reco_out = recommend_for_user(cfg)
+                recs = reco_out.get("recommendations") or []
+                recs = [dict(r) if not isinstance(r, dict) else r for r in recs]
+                if not out.get("reply"):
+                    out["reply"] = "Here are some items you might like."
+            except Exception:
+                recs = recs  # keep empty on failure
+
+        # === 3) Normalize fields (categories, score, price) ===
+        _normalize_categories_in_place(recs)
+
+        for r in recs:
+            # coerce price
+            v = r.get("price")
+            try:
+                rv = float(v) if v not in (None, "", "nan") else None
+                if isinstance(rv, float) and not math.isfinite(rv):
+                    rv = None
+                r["price"] = rv
+            except Exception:
+                r["price"] = None
+            # coerce score
+            v = r.get("score")
+            try:
+                rv = float(v) if v not in (None, "", "nan") else None
+                if isinstance(rv, float) and not math.isfinite(rv):
+                    rv = None
+                r["score"] = rv
+            except Exception:
+                r["score"] = None
+
+        # === 4) Apply lightweight chat constraints (budget + keyword) ===
+        last = (msgs[-1]["content"] if msgs else "") or ""
+        cap = _parse_price_cap(last)
+        kw  = _parse_keyword(last)
+
+        if cap is not None:
+            recs = [r for r in recs if (r.get("price") is not None and r["price"] <= cap)]
+
+        if kw:
+            lowkw = kw.lower()
+            def _matches(item: Dict[str, Any]) -> bool:
+                fields = [str(item.get("brand") or ""), str(item.get("item_id") or "")]
+                fields.extend(item.get("categories") or [])
+                hay = " ".join(fields).lower()
+                return lowkw in hay
+            filtered = [r for r in recs if _matches(r)]
+            # only narrow if we actually get something
+            if filtered:
+                recs = filtered
+        # --- FINAL categories fix (right before returning) ---
+        for r in recs:
+            cats = r.get("categories")
+            # If it's exactly one string like "['A','B']" -> parse it
+            if isinstance(cats, list) and len(cats) == 1 and isinstance(cats[0], str):
+                try:
+                    lit = cats[0].strip()
+                    if (lit.startswith("[") and lit.endswith("]")) or (lit.startswith("(") and lit.endswith(")")):
+                        parsed = ast.literal_eval(lit)
+                        if isinstance(parsed, (list, tuple, set)):
+                            r["categories"] = [str(x).strip() for x in parsed if x is not None and str(x).strip()]
+                except Exception:
+                    # leave as-is if it can't be parsed
+                    pass
+        # === 5) Return ===
+        out.setdefault("reply", "")
+        out["recommendations"] = recs
+        return JSONResponse(content=_to_jsonable(out))
+
+    except Exception as e:
+        tb = traceback.format_exc(limit=5)
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"/chat_recommend failed: {e}", "traceback": tb},
+        )
+    
+@app.get("/healthz")
+def healthz():
+    return {
+        "ok": True,
+        "service": "MMR-Agentic-CoVE API",
+        "version": getattr(app, "version", None) or "unknown",
     }
-    status.textContent = 'OK';
-    (body.recommendations || []).forEach(rec => {
-      const div = document.createElement('div');
-      div.className = 'card';
-      div.innerHTML = `
-        <div><b>${rec.item_id || ''}</b></div>
-        <div class="score">score: ${(rec.score ?? 0).toFixed(4)}</div>
-        ${rec.image_url ? `<img src="${rec.image_url}" />` : ''}
-        <div>Brand: ${rec.brand ?? '-'}</div>
-        <div>Price: ${typeof rec.price === 'number' ? '$' + rec.price.toFixed(2) : '-'}</div>
-        <div>Categories: ${rec.categories ?? '-'}</div>
-      `;
-      cards.appendChild(div);
-    });
-  }catch(e){
-    status.textContent = 'Request failed: ' + e;
-  }
-}
-</script>
-</body>
-</html>
-    """
 
 
-# -----------------------------------------------------------------------------
-# Run directly (use 0.0.0.0 so Cloudflare can reach it)
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("api.app_api:app", host="0.0.0.0", port=8000, reload=True)
+@app.get("/")
+def root():
+    return {"ok": True, "service": "MMR-Agentic-CoVE API"}

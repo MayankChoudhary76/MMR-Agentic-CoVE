@@ -6,7 +6,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -18,11 +18,12 @@ from src.utils.paths import ensure_dir
 # ---------------------------
 # Path resolution (dict / tuple / attrs → fallback)
 # ---------------------------
-def _resolve_paths(dataset: str):
+def _resolve_paths(dataset: str) -> Tuple[Path, Path]:
     """
     Works with dict keys: raw/raw_dir/processed/processed_dir,
     tuple/list (raw, processed), or attribute-style objects.
     Falls back to data/<raw|processed>/<dataset>.
+    Always returns concrete dataset subfolders for both raw and processed.
     """
     paths = get_paths(dataset)
 
@@ -31,17 +32,33 @@ def _resolve_paths(dataset: str):
         raw = paths.get("raw") or paths.get("raw_dir") or paths.get("raw_path")
         proc = paths.get("processed") or paths.get("processed_dir") or paths.get("proc") or paths.get("processed_path")
         if raw and proc:
-            return Path(raw), Path(proc)
+            raw_dir = Path(raw)
+            proc_dir = Path(proc)
+            if proc_dir.name != dataset:
+                proc_dir = proc_dir / dataset
+            if raw_dir.name != dataset:
+                raw_dir = raw_dir / dataset
+            return raw_dir, proc_dir
 
-    # tuple/list
+    # tuple/list (raw, processed)
     if isinstance(paths, (tuple, list)) and len(paths) >= 2:
-        return Path(paths[0]), Path(paths[1])
+        raw_dir, proc_dir = Path(paths[0]), Path(paths[1])
+        if proc_dir.name != dataset:
+            proc_dir = proc_dir / dataset
+        if raw_dir.name != dataset:
+            raw_dir = raw_dir / dataset
+        return raw_dir, proc_dir
 
     # attribute-style (e.g., SimpleNamespace)
     raw = getattr(paths, "raw", None) or getattr(paths, "raw_dir", None) or getattr(paths, "raw_path", None)
     proc = getattr(paths, "processed", None) or getattr(paths, "processed_dir", None) or getattr(paths, "processed_path", None)
     if raw and proc:
-        return Path(raw), Path(proc)
+        raw_dir, proc_dir = Path(raw), Path(proc)
+        if proc_dir.name != dataset:
+            proc_dir = proc_dir / dataset
+        if raw_dir.name != dataset:
+            raw_dir = raw_dir / dataset
+        return raw_dir, proc_dir
 
     # fallback
     return Path("data/raw") / dataset, Path("data/processed") / dataset
@@ -57,7 +74,8 @@ def _to_float_price(x: Any) -> Optional[float]:
         s = str(x).strip()
         if not s:
             return None
-        s = re.sub(r"[^0-9.]", "", s)  # keep digits & dot
+        # keep digits & dot only (handles "$12.34", "USD 12.34", etc.)
+        s = re.sub(r"[^0-9.]", "", s)
         return float(s) if s else None
     except Exception:
         return None
@@ -200,12 +218,21 @@ def main():
         price = _to_float_price(d.get("price"))
         categories = _flatten_categories(d)
         image_url = _pick_image(d)
+        # normalize empty strings to None for brand/image_url
+        if brand is not None and not brand.strip():
+            brand_none = None
+        else:
+            brand_none = brand
+        if isinstance(image_url, str) and not image_url.strip():
+            image_url_none = None
+        else:
+            image_url_none = image_url
         return {
             "item_id": asin,
-            "brand": brand,
+            "brand": brand_none,
             "price": price,
             "categories": categories,
-            "image_url": image_url,
+            "image_url": image_url_none,
         }
 
     if not meta_df.empty:
@@ -223,6 +250,16 @@ def main():
 
     # Unique items with meta among interacted items
     items_with_meta = joined[["item_id", "brand", "price", "categories", "image_url"]].drop_duplicates("item_id")
+
+    # Clean empty strings to proper missing values for coverage
+    def _none_if_empty(x):
+        if isinstance(x, str) and not x.strip():
+            return None
+        return x
+
+    items_with_meta["brand"] = items_with_meta["brand"].apply(_none_if_empty)
+    items_with_meta["image_url"] = items_with_meta["image_url"].apply(_none_if_empty)
+
     out_items = proc_dir / "items_with_meta.parquet"
     items_with_meta.to_parquet(out_items, index=False)
 
