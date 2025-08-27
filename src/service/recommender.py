@@ -10,6 +10,8 @@ import pandas as pd
 from pathlib import Path
 from pathlib import Path
 import pandas as pd
+import ast
+import math
 
 from src.utils.paths import get_processed_path
 from src.models.fusion import l2norm  # keep using the shared l2norm
@@ -98,24 +100,97 @@ def _stack_and_weight(mats: List[np.ndarray], weights: Optional[List[float]] = N
         mats = [w * m for w, m in zip(weights, mats)]
     return np.hstack(mats).astype(np.float32)
 
+def _normalize_categories(cats):
+    """Return categories as a clean Python list."""
+    if isinstance(cats, list):
+        return cats
+    if isinstance(cats, str):
+        try:
+            v = ast.literal_eval(cats)  # handles "['Beauty']" → ['Beauty']
+            if isinstance(v, list):
+                return v
+        except Exception:
+            pass
+        return [cats]
+    return [] if cats is None else [str(cats)]
 
 def _read_items_table(proc: Path) -> pd.DataFrame:
     """
     Returns a table with item_id + presentation fields to display alongside scores.
-    Expected columns in items_with_meta.parquet: ['item_id','brand','price','categories','image_url']
+    Prefer items_catalog.parquet (has title/rank already parsed), then fall back.
     """
-    fp = proc / "items_with_meta.parquet"
-    if not fp.exists():
-        # Backoff: try joined.parquet and reduce to unique items
-        j = pd.read_parquet(proc / "joined.parquet")
-        cols = ["item_id"]
-        for c in ["brand", "price", "categories", "image_url"]:
-            if c in j.columns:
-                cols.append(c)
-        it = j[cols].drop_duplicates("item_id").reset_index(drop=True)
-        return it
-    return pd.read_parquet(fp)
+    # 1) Preferred enriched catalog
+    fp0 = proc / "items_catalog.parquet"
+    if fp0.exists():
+        df = pd.read_parquet(fp0)
+    else:
+        # 2) Fallback to items_with_meta.parquet
+        fp1 = proc / "items_with_meta.parquet"
+        if fp1.exists():
+            df = pd.read_parquet(fp1)
+        else:
+            # 3) Last resort: joined.parquet (dedup by item_id)
+            fp2 = proc / "joined.parquet"
+            if not fp2.exists():
+                return pd.DataFrame(columns=["item_id","brand","price","categories","image_url","title","rank"])
+            j = pd.read_parquet(fp2)
+            cols = [c for c in ["item_id","brand","price","categories","image_url","title","rank"] if c in j.columns]
+            df = j[cols].dropna(subset=["item_id"]).drop_duplicates(subset=["item_id"])
 
+    # Ensure expected columns exist
+    for c in ["brand","price","categories","image_url","title","rank","rank_num","rank_cat"]:
+        if c not in df.columns:
+            df[c] = None
+
+    # Normalize categories (fix stringified lists)
+    
+    def _fix_cat(v):
+        # null-ish → []
+        try:
+            import pandas as pd, numpy as np
+            if v is None or (isinstance(v, float) and math.isnan(v)):  # if math is not imported, use pd.isna
+                return []
+            if 'pd' in locals() and pd.isna(v):
+                return []
+        except Exception:
+            pass
+
+        # already list-like
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if x is not None and str(x).strip()]
+
+        # numpy array
+        try:
+            import numpy as np
+            if isinstance(v, np.ndarray):
+                return [str(x).strip() for x in v.tolist() if x is not None and str(x).strip()]
+        except Exception:
+            pass
+
+        # string cases
+        if isinstance(v, str):
+            s = v.strip()
+            if not s or s == "[]":
+                return []
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+                try:
+                    import ast
+                    parsed = ast.literal_eval(s)
+                    if isinstance(parsed, (list, tuple)):
+                        return [str(x).strip() for x in parsed if x is not None and str(x).strip()]
+                except Exception:
+                    # fall through to single-label
+                    pass
+            return [s]
+
+        # fallback
+        return []
+
+    
+    df["categories"] = df["categories"].map(_fix_cat)
+
+    df["item_id"] = df["item_id"].astype(str)
+    return df[["item_id","brand","price","categories","image_url","title","rank","rank_num","rank_cat"]]
 
 def _seen_items(proc: Path, user_id: str) -> set[str]:
     """Return a set of item_ids the user has interacted with (to optionally exclude)."""
@@ -266,8 +341,8 @@ def _faiss_topk(index_fp: Path, ids_fp: Path, queries: np.ndarray, k: int) -> Tu
 
 def recommend_for_user(cfg: RecommendConfig) -> Dict:
     """
-    Produce top‑K recommendations for a user with either concat (feature‑level) fusion
-    or weighted (score‑level) fusion. Returns a dict with 'recommendations' and metadata.
+    Produce top-K recommendations for a user with either concat (feature-level) fusion
+    or weighted (score-level) fusion. Returns a dict with 'recommendations' and metadata.
     """
     proc = get_processed_path(cfg.dataset)
 
@@ -276,17 +351,20 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
     if cfg.user_id not in users:
         raise ValueError(f"user_id {cfg.user_id} not found in user_text_emb.parquet")
     u_idx = users.index(cfg.user_id)
-    u = U[u_idx : u_idx + 1]  # [1 x D], expected L2‑normalized already
+    u = U[u_idx : u_idx + 1]  # [1 x D], expected L2-normalized already
 
     # --- Load items & modalities
-    items_df = _read_items_table(proc)         # item details
+    items_df = _read_items_table(proc)         # prefer items_with_meta / joined, normalized
     items_order = _load_item_ids(proc)         # authoritative id order
     id2pos = {iid: i for i, iid in enumerate(items_order)}
 
-    mods = _load_item_modalities(proc)         # dict: text/image/meta -> [I x D], L2‑normalized
+    mods = _load_item_modalities(proc)         # dict: text/image/meta -> [I x D], L2-normalized
     Vf, dims = _fuse_items(mods, cfg.fusion, cfg.weights)
 
-    # --- Build user feature for concat, or compute score‑level for weighted
+    # --- Build user feature for concat, or compute score-level for weighted
+    score_map: Dict[str, float] = {}
+    candidate_ids: List[str] = []
+
     if cfg.fusion == "concat":
         parts_u: List[np.ndarray] = []
         wts: List[float] = []
@@ -309,22 +387,27 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
         uf = l2norm(_stack_and_weight(parts_u, wts))  # [1 x Df]
 
         # --- Search
+        extra = 200 if cfg.exclude_seen else 0
+        take_k = cfg.k + extra
+
         if cfg.use_faiss:
             if not cfg.faiss_name:
                 raise ValueError("--use_faiss requires --faiss_name")
             idx_dir = proc / "index"
-            D, top_ids = _faiss_topk(
+            D, faiss_ids = _faiss_topk(
                 idx_dir / f"items_{cfg.faiss_name}.faiss",
                 idx_dir / f"items_{cfg.faiss_name}.npy",
-                uf, cfg.k + (200 if cfg.exclude_seen else 0)
+                uf, take_k
             )
-            # If FAISS index was built with IP on L2norm, distances are sims already.
-            scores = D
+            # FAISS scores are aligned with faiss_ids
+            candidate_ids = faiss_ids
+            score_map = {iid: float(s) for iid, s in zip(faiss_ids, D.tolist())}
         else:
-            sims = _cosine_scores(uf, Vf)  # [1 x I]
-            scores = sims[0]
-            top_idx = np.argsort(-scores)
-            top_ids = [items_order[i] for i in top_idx[: cfg.k + (200 if cfg.exclude_seen else 0)]]
+            sims = _cosine_scores(uf, Vf)[0]  # [I]
+            order = np.argsort(-sims)[:take_k]
+            candidate_ids = [items_order[i] for i in order]
+            # map from all items (or at least the candidates) to score
+            score_map = {items_order[i]: float(sims[i]) for i in order}
 
     elif cfg.fusion == "weighted":
         # ----- effective weights with alpha (if provided)
@@ -337,7 +420,7 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
             wt = wt * a
             wi = wi * (1.0 - a)
 
-        # ----- score‑level similarities
+        # ----- score-level similarities
         sims_total = None
 
         if "text" in mods and wt != 0:
@@ -359,49 +442,77 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
         if sims_total is None:
             raise RuntimeError("No similarities could be computed in 'weighted' fusion.")
 
-        scores = sims_total
-        top_idx = np.argsort(-scores)
-        top_ids = [items_order[i] for i in top_idx[: cfg.k + (200 if cfg.exclude_seen else 0)]]
+        extra = 200 if cfg.exclude_seen else 0
+        order = np.argsort(-sims_total)[: cfg.k + extra]
+        candidate_ids = [items_order[i] for i in order]
+        score_map = {items_order[i]: float(sims_total[i]) for i in order}
 
-        # NOTE: FAISS index is built for concatenated vectors.
-        # For 'weighted' score-level fusion we currently use dense scoring only.
+        # NOTE: FAISS index is for concatenated vectors. For 'weighted' we use dense scoring only.
 
     else:
         raise ValueError(f"Unknown fusion scheme: {cfg.fusion}")
 
-    # --- Exclude seen if requested
+    # --- Exclude seen if requested, build final lists
     if cfg.exclude_seen:
         seen = _seen_items(proc, cfg.user_id)
-        filtered: List[Tuple[str, float]] = []
-        for iid in top_ids:
+        top_pairs: List[Tuple[str, float]] = []
+        for iid in candidate_ids:
             if iid not in seen:
-                filtered.append((iid, float(scores[id2pos[iid]])))
-            if len(filtered) >= cfg.k:
-                break
-        top_ids, top_scores = zip(*filtered) if filtered else ([], [])
+                sc = score_map.get(iid)
+                if sc is not None:
+                    top_pairs.append((iid, sc))
+                if len(top_pairs) >= cfg.k:
+                    break
+        top_ids, top_scores = zip(*top_pairs) if top_pairs else ([], [])
     else:
-        top_scores = [float(scores[id2pos[iid]]) for iid in top_ids[: cfg.k]]
+        top_ids = candidate_ids[: cfg.k]
+        top_scores = [score_map[iid] for iid in top_ids]
 
     # --- Attach presentation fields
     items_df = items_df.copy()
     items_df["item_id"] = items_df["item_id"].astype(str)
-    meta_cols = ["brand", "price", "categories", "image_url"]
+    meta_cols = ["brand", "price", "categories", "image_url", "title", "rank", "rank_num"]
     for c in meta_cols:
         if c not in items_df.columns:
             items_df[c] = None
-
     meta_map = items_df.set_index("item_id")[meta_cols].to_dict(orient="index")
 
     recs = []
     for iid, sc in zip(top_ids, top_scores):
-        row = meta_map.get(str(iid), {})
+        row = meta_map.get(str(iid), {}) or {}
+
+        # normalize categories to a list
+        cats = row.get("categories")
+        if isinstance(cats, str):
+            try:
+                parsed = ast.literal_eval(cats)
+                cats = list(parsed) if isinstance(parsed, (list, tuple)) else []
+            except Exception:
+                cats = []
+        elif isinstance(cats, (list, tuple)):
+            cats = list(cats)
+        else:
+            cats = []
+
+        # parse rank to int if only string available
+        rnum = row.get("rank_num")
+        if rnum is None:
+            r = row.get("rank")
+            if isinstance(r, str):
+                m = re.search(r"[\d,]+", r)
+                rnum = int(m.group(0).replace(",", "")) if m else None
+            elif isinstance(r, (int, float)):
+                rnum = int(r)
+
         recs.append({
             "item_id": str(iid),
             "score": float(sc),
             "brand": row.get("brand"),
             "price": row.get("price"),
-            "categories": row.get("categories"),
+            "categories": cats,
             "image_url": row.get("image_url"),
+            "title": row.get("title"),
+            "rank": rnum,
         })
 
     return {
@@ -416,51 +527,3 @@ def recommend_for_user(cfg: RecommendConfig) -> Dict:
         "faiss_name": cfg.faiss_name,
         "recommendations": recs,
     }
-
-def _load_item_metadata(proc: Path) -> pd.DataFrame:
-    """
-    Load item metadata (brand, price, categories, image_url) for enrichment.
-    Prefers items_with_meta.parquet; falls back to joined.parquet (dedup by item_id).
-    Returns a DataFrame with columns: item_id, brand, price, categories, image_url
-    """
-    # 1) Preferred file
-    fp1 = proc / "items_with_meta.parquet"
-    if fp1.exists():
-        df = pd.read_parquet(fp1)
-    else:
-        # 2) Fallback to joined.parquet and deduplicate per item_id
-        fp2 = proc / "joined.parquet"
-        if not fp2.exists():
-            # Nothing to enrich with; return empty df with expected columns
-            return pd.DataFrame(columns=["item_id", "brand", "price", "categories", "image_url"])
-        j = pd.read_parquet(fp2)
-        cols = ["item_id", "brand", "price", "categories", "image_url"]
-        cols = [c for c in cols if c in j.columns]
-        if "item_id" not in cols:
-            return pd.DataFrame(columns=["item_id", "brand", "price", "categories", "image_url"])
-        df = j[cols].dropna(subset=["item_id"]).drop_duplicates(subset=["item_id"])
-
-    # Normalize dtypes/values for JSON safety
-    if "categories" in df.columns:
-        # convert numpy object arrays (e.g., array(['Beauty & Personal Care'], dtype=object)) to plain lists/strings
-        def _fix_cat(v):
-            try:
-                if isinstance(v, (list, tuple)):
-                    return list(v)
-                # numpy array → list
-                import numpy as np
-                if isinstance(v, np.ndarray):
-                    return v.tolist()
-            except Exception:
-                pass
-            return v
-        df["categories"] = df["categories"].map(_fix_cat)
-
-    # Ensure the minimal column set exists
-    for col in ["brand", "price", "categories", "image_url"]:
-        if col not in df.columns:
-            df[col] = None
-
-    # item_id must be string for safe joins
-    df["item_id"] = df["item_id"].astype(str)
-    return df[["item_id", "brand", "price", "categories", "image_url"]]
