@@ -58,3 +58,4 @@ models/
 *.pth
 *.bin
 *.ckpt
+logs/
