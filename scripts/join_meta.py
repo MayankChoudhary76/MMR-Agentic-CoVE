@@ -82,17 +82,32 @@ def _to_float_price(x: Any) -> Optional[float]:
 
 
 def _pick_image(row: dict) -> Optional[str]:
-    # Prefer HighRes list/url, then imageURL list/url
-    for key in ("imageURLHighRes", "imageURL"):
-        v = row.get(key)
-        if isinstance(v, list) and v:
+    def _first_url(v):
+        if isinstance(v, list):
             for u in v:
-                if isinstance(u, str) and u.strip():
-                    return u.strip()
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
+                if isinstance(u, str):
+                    u=u.strip()
+                    if u.startswith(("http://","https://")):
+                        return u
+        if isinstance(v, str):
+            s=v.strip()
+            if s.startswith(("http://","https://")):
+                return s
+        return None
 
+    for key in ("imageURLHighRes", "imageURL"):
+        u = _first_url(row.get(key))
+        if u:
+            return u
+
+    # OPTIONAL: very lenient scrape from big HTML blobs (only if you want it)
+    sim = row.get("similar_item")
+    if isinstance(sim, str) and "src=" in sim:
+        import re
+        m = re.search(r'src="\s*(https?://[^"]+)"', sim)
+        if m:
+            return m.group(1).strip()
+    return None
 
 def _norm_brand(x: Any) -> Optional[str]:
     if x is None:

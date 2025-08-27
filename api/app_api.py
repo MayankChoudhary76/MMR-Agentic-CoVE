@@ -23,6 +23,10 @@ from src.agents.chat_agent import ChatAgent, ChatAgentConfig
 # Instantiate the chat agent used by /chat_recommend
 CHAT_AGENT = ChatAgent(ChatAgentConfig())
 
+
+# =========================
+# Introspection (agentz)
+# =========================
 def _agent_introspection():
     try:
         fn = getattr(ChatAgent, "reply", None)
@@ -42,57 +46,13 @@ def _agent_introspection():
         }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
-    
-# ---------------- Helpers ----------------
-def _parse_listlike_string(s: str) -> List[str]:
-    """
-    Parse strings like "['A','B']" or '["A"]' into ['A','B']; otherwise produce a best-effort list.
-    """
-    if not isinstance(s, str):
-        return []
-    t = s.strip()
-    if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
-        try:
-            val = ast.literal_eval(t)
-            if isinstance(val, (list, tuple, set)):
-                return [str(x).strip() for x in val if x is not None and str(x).strip()]
-        except Exception:
-            pass
-    # Fallback: split on common delimiters or return scalar
-    if re.search(r"[>|,/;]+", t):
-        return [p.strip() for p in re.split(r"[>|,/;]+", t) if p.strip()]
-    return [t] if t else []
 
-def _enrich_with_catalog(dataset: str, recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Fill missing fields (title, rank, image_url, price, categories) from items_catalog.parquet."""
-    try:
-        proc = get_processed_path(dataset)
-        cat_fp = proc / "items_catalog.parquet"
-        if not cat_fp.exists() or not recs:
-            return recs
-        df = pd.read_parquet(cat_fp)
-        df = df[["item_id","title","rank","image_url","price","categories"]].copy()
-        cat = {str(r.item_id): r for r in df.itertuples(index=False)}
-        out = []
-        for r in recs:
-            iid = str(r.get("item_id",""))
-            add = cat.get(iid)
-            if add:
-                # fill if missing
-                r.setdefault("title", getattr(add,"title"))
-                r.setdefault("rank",  None if pd.isna(getattr(add,"rank")) else int(getattr(add,"rank")))
-                r.setdefault("image_url", getattr(add,"image_url"))
-                if r.get("price") in (None,"",0) and pd.notna(getattr(add,"price")):
-                    r["price"] = float(getattr(add,"price"))
-                if not r.get("categories"):
-                    r["categories"] = getattr(add,"categories")
-            out.append(r)
-        return out
-    except Exception:
-        return recs
-    
-# --- simple parsers for budget + keyword ---
+
+# =========================
+# Helpers (parsing/cleanup)
+# =========================
 _PRICE_RE = re.compile(r"\$?\s*([0-9]+(?:\.[0-9]+)?)")
+_STOPWORDS = {"under","below","less","than","max","upto","up","to","recommend","something","for","me","need","budget","cheap","please","soap","shampoos"}
 
 def _parse_price_cap(text: str) -> Optional[float]:
     m = _PRICE_RE.search(text or "")
@@ -103,7 +63,6 @@ def _parse_price_cap(text: str) -> Optional[float]:
     except Exception:
         return None
 
-_STOPWORDS = {"under","below","less","than","max","upto","up","to","recommend","something","for","me","need","budget","cheap","please","soap","shampoos"}
 def _parse_keyword(text: str) -> Optional[str]:
     t = (text or "").lower()
     t = _PRICE_RE.sub(" ", t)
@@ -113,20 +72,31 @@ def _parse_keyword(text: str) -> Optional[str]:
         return w
     return None
 
+def _parse_listlike_string(s: str) -> List[str]:
+    """Parse strings like "['A','B']" or '["A"]' into ['A','B']; otherwise a best-effort list."""
+    if not isinstance(s, str):
+        return []
+    t = s.strip()
+    if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
+        try:
+            val = ast.literal_eval(t)
+            if isinstance(val, (list, tuple, set)):
+                return [str(x).strip() for x in val if x is not None and str(x).strip()]
+        except Exception:
+            pass
+    if re.search(r"[>|,/;]+", t):
+        return [p.strip() for p in re.split(r"[>|,/;]+", t) if p.strip()]
+    return [t] if t else []
+
 def _normalize_categories_in_place(items):
     """
     Force each item's 'categories' into a clean List[str].
-    Handles:
-      - None
-      - "['A','B']"  (stringified list)
-      - ["['A','B']"] (list holding a stringified list)
-      - list/tuple/set of strings and/or nested containers
+    Supports None, stringified lists, nested containers, etc.
     """
     def _as_list_from_string(s: str) -> List[str]:
         s = (s or "").strip()
         if not s:
             return []
-        # Try to parse a literal list/tuple first
         if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
             try:
                 parsed = ast.literal_eval(s)
@@ -134,13 +104,11 @@ def _normalize_categories_in_place(items):
                     return [str(x).strip() for x in parsed if x is not None and str(x).strip()]
             except Exception:
                 pass
-        # Fallback: treat as a single label
         return [s]
 
     for r in items or []:
         cats = r.get("categories")
         out: List[str] = []
-
         if cats is None:
             out = []
         elif isinstance(cats, str):
@@ -166,7 +134,6 @@ def _normalize_categories_in_place(items):
                     s = str(c).strip()
                     if s:
                         tmp.append(s)
-            # dedupe while preserving order
             seen = set()
             out = []
             for x in tmp:
@@ -176,29 +143,78 @@ def _normalize_categories_in_place(items):
         else:
             s = str(cats).strip()
             out = [s] if s else []
-
         r["categories"] = out
 
+def _first_image_url_from_row(row: pd.Series) -> Optional[str]:
+    """
+    Return a single best image URL from several possible columns or formats:
+      - 'image_url' scalar string or list
+      - 'imageURL' / 'imageURLHighRes' (AMZ style) with lists or stringified lists
+    """
+    candidates: List[Any] = []
+    for col in ["image_url", "imageURLHighRes", "imageURL"]:
+        if col in row.index:
+            candidates.append(row[col])
+
+    urls: List[str] = []
+    for v in candidates:
+        if v is None:
+            continue
+        if isinstance(v, str):
+            # could be a URL or a stringified list
+            vv = v.strip()
+            if (vv.startswith("[") and vv.endswith("]")) or (vv.startswith("(") and vv.endswith(")")):
+                try:
+                    lst = ast.literal_eval(vv)
+                    if isinstance(lst, (list, tuple, set)):
+                        urls.extend([str(x).strip() for x in lst if x])
+                except Exception:
+                    if vv:
+                        urls.append(vv)
+            else:
+                urls.append(vv)
+        elif isinstance(v, (list, tuple, set)):
+            urls.extend([str(x).strip() for x in v if x])
+        else:
+            s = str(v).strip()
+            if s:
+                urls.append(s)
+
+    # pick first reasonable http(s) url, else first non-empty
+    for u in urls:
+        if u.lower().startswith("http"):
+            return u
+    return urls[0] if urls else None
+
+def _parse_rank_num(s: Any) -> Optional[int]:
+    """Extract numeric rank from strings like '2,938,573 in Beauty & Personal Care ('."""
+    if s is None or (isinstance(s, float) and not math.isfinite(s)):
+        return None
+    try:
+        if isinstance(s, (int, float)):
+            return int(s)
+        txt = str(s)
+        m = re.search(r"([\d,]+)", txt)
+        if not m:
+            return None
+        return int(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
 def _to_jsonable(obj: Any):
-    """
-    Convert numpy/pandas and other non‑JSON‑serializable objects to plain Python types.
-    Replace NaN/Inf with None to satisfy strict JSON.
-    """
+    """Convert numpy/pandas and other non-JSON-serializable objects to plain Python types."""
     try:
         import numpy as np  # type: ignore
     except Exception:
         np = None  # type: ignore
 
-    # primitives
     if obj is None or isinstance(obj, (str, bool)):
         return obj
-
     if isinstance(obj, (int, float)):
         if isinstance(obj, float) and not math.isfinite(obj):
             return None
         return obj
 
-    # numpy scalars
     if np is not None:
         if isinstance(obj, getattr(np, "integer", ())):
             return int(obj)
@@ -208,27 +224,245 @@ def _to_jsonable(obj: Any):
         if isinstance(obj, getattr(np, "bool_", ())):
             return bool(obj)
 
-    # containers
     if isinstance(obj, dict):
         return {str(k): _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
         return [_to_jsonable(v) for v in obj]
 
-    # pandas
     if isinstance(obj, pd.Series):
         return {str(k): _to_jsonable(v) for k, v in obj.to_dict().items()}
     if isinstance(obj, pd.DataFrame):
         return [_to_jsonable(r) for r in obj.to_dict(orient="records")]
 
-    # namedtuple / objects with _asdict
     if hasattr(obj, "_asdict"):
         return {str(k): _to_jsonable(v) for k, v in obj._asdict().items()}
 
-    # last resort
     return str(obj)
 
 
-# ---------------- FastAPI app ----------------
+# =========================
+# Catalog enrichment (API)
+# =========================
+def _load_catalog_like(dataset: str) -> pd.DataFrame:
+    """
+    Load an item catalog table for enrichment.
+    Preference:
+      1) items_catalog.parquet (enriched)
+      2) items_with_meta.parquet
+      3) joined.parquet (dedup on item_id)
+    Ensures presence of: item_id, title, brand, price, categories, image_url, rank.
+    """
+    proc = get_processed_path(dataset)
+    cands = [
+        proc / "items_catalog.parquet",
+        proc / "items_with_meta.parquet",
+        proc / "joined.parquet",
+    ]
+    df = pd.DataFrame()
+    for fp in cands:
+        if fp.exists():
+            try:
+                df = pd.read_parquet(fp)
+                break
+            except Exception:
+                pass
+
+    if df.empty:
+        return pd.DataFrame(columns=["item_id","title","brand","price","categories","image_url","rank"])
+
+    # If we loaded joined.parquet, dedup rows to unique item_id
+    if "item_id" in df.columns and df["item_id"].duplicated().any():
+        df = df.dropna(subset=["item_id"]).drop_duplicates(subset=["item_id"])
+
+    # Guarantee columns exist
+    for c in ["item_id","title","brand","price","categories","image_url","imageURL","imageURLHighRes","rank","rank_num"]:
+        if c not in df.columns:
+            df[c] = None
+
+    # Normalize derived columns
+    df["item_id"] = df["item_id"].astype(str)
+
+    # Best-effort image_url column
+    # Build a single 'image_url_best' column we'll use for enrichment
+    img_urls: List[Optional[str]] = []
+    for row in df.itertuples(index=False):
+        r = pd.Series(row._asdict() if hasattr(row, "_asdict") else row._asdict())
+        img_urls.append(_first_image_url_from_row(r))
+    df["image_url_best"] = img_urls
+
+    # Best-effort numeric rank
+    if "rank_num" in df.columns:
+        # fill missing rank_num from rank string
+        need = df["rank_num"].isna()
+        if "rank" in df.columns and need.any():
+            df.loc[need, "rank_num"] = df.loc[need, "rank"].map(_parse_rank_num)
+    else:
+        df["rank_num"] = df["rank"].map(_parse_rank_num)
+
+    return df[["item_id","title","brand","price","categories","image_url_best","rank","rank_num"]].rename(
+        columns={"image_url_best":"image_url"}
+    )
+
+
+def _enrich_with_catalog(dataset: str, recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not recs:
+        return recs
+    try:
+        proc = get_processed_path(dataset)
+
+        # Load sources and keep extra image columns if present
+        sources: List[pd.DataFrame] = []
+        for name in ["items_catalog.parquet", "items_with_meta.parquet", "joined.parquet"]:
+            fp = proc / name
+            if fp.exists():
+                try:
+                    df = pd.read_parquet(fp)
+                    keep = [c for c in [
+                        "item_id","title","brand","price","categories","image_url","rank","rank_num",
+                        # extra image columns from raw meta
+                        "imageURLHighRes","imageURL"
+                    ] if c in df.columns]
+                    if "item_id" in keep:
+                        slim = df[keep].copy()
+                        slim["item_id"] = slim["item_id"].astype(str)
+                        sources.append(slim.set_index("item_id", drop=False))
+                except Exception:
+                    pass
+        if not sources:
+            return recs
+
+        import ast, math, re
+
+        def _pick_non_empty(*vals):
+            for v in vals:
+                if v is None:
+                    continue
+                if isinstance(v, float) and not math.isfinite(v):
+                    continue
+                s = v.strip() if isinstance(v, str) else v
+                if s == "" or s == "nan":
+                    continue
+                return v
+            return None
+
+        def _pick_price(*vals):
+            for v in vals:
+                try:
+                    if v in (None, "", "nan"):
+                        continue
+                    f = float(v)
+                    if math.isfinite(f):
+                        return f
+                except Exception:
+                    continue
+            return None
+
+        def _norm_categories(v):
+            if v is None:
+                return []
+            if isinstance(v, (list, tuple, set)):
+                return [str(x).strip() for x in v if x is not None and str(x).strip()]
+            if isinstance(v, str):
+                s = v.strip()
+                if not s or s == "[]":
+                    return []
+                try:
+                    parsed = ast.literal_eval(s)
+                    if isinstance(parsed, (list, tuple, set)):
+                        return [str(x).strip() for x in parsed if x is not None and str(x).strip()]
+                except Exception:
+                    return [s]
+            return []
+
+        def _pick_categories(*vals):
+            for v in vals:
+                cats = _norm_categories(v)
+                if cats:
+                    return cats
+            return []
+
+        def _first_url_from_list(v):
+            if isinstance(v, (list, tuple)):
+                for u in v:
+                    if isinstance(u, str) and u.strip():
+                        return u.strip()
+            return None
+
+        def _pick_image_url(cand_image_url, cand_highres, cand_image):
+            # priority: explicit image_url (string), then imageURLHighRes[0], then imageURL[0]
+            if isinstance(cand_image_url, str) and cand_image_url.strip():
+                return cand_image_url.strip()
+            u = _first_url_from_list(cand_highres)
+            if u:
+                return u
+            u = _first_url_from_list(cand_image)
+            if u:
+                return u
+            # allow lists passed through the reco as well
+            if isinstance(cand_image_url, list):
+                u = _first_url_from_list(cand_image_url)
+                if u:
+                    return u
+            return None
+
+        def _pick_rank(*vals):
+            for v in vals:
+                if v is None or (isinstance(v, float) and not math.isfinite(v)):
+                    continue
+                if isinstance(v, (int, float)):
+                    return int(v)
+                if isinstance(v, str):
+                    m = re.search(r"[\d,]+", v)
+                    if m:
+                        try:
+                            return int(m.group(0).replace(",", ""))
+                        except Exception:
+                            pass
+            return None
+
+        def _lookup(iid: str, col: str):
+            for src in sources:
+                if iid in src.index and col in src.columns:
+                    return src.at[iid, col]
+            return None
+
+        out = []
+        for r in recs:
+            iid = str(r.get("item_id", ""))
+            if not iid:
+                out.append(r); continue
+
+            title = _pick_non_empty(r.get("title"), _lookup(iid, "title"))
+            brand = _pick_non_empty(r.get("brand"), _lookup(iid, "brand"))
+            price = _pick_price(r.get("price"), _lookup(iid, "price"))
+            cats  = _pick_categories(r.get("categories"), _lookup(iid, "categories"))
+            img   = _pick_image_url(
+                _lookup(iid, "image_url"),
+                _lookup(iid, "imageURLHighRes"),
+                _lookup(iid, "imageURL"),
+            )
+            rank  = _pick_rank(r.get("rank"), _lookup(iid, "rank_num"), _lookup(iid, "rank"))
+
+            if not cats and dataset.lower() == "beauty":
+                cats = ["Beauty & Personal Care"]
+
+            rr = {**r}
+            if title is not None: rr["title"] = title
+            if brand is not None: rr["brand"] = brand
+            rr["price"] = price
+            rr["categories"] = cats
+            rr["image_url"] = img
+            rr["rank"] = rank
+            out.append(rr)
+        return out
+    except Exception:
+        return recs
+
+
+
+# =========================
+# FastAPI app
+# =========================
 app = FastAPI(title="MMR-Agentic-CoVE API", version="1.0.3")
 
 app.add_middleware(
@@ -240,7 +474,9 @@ app.add_middleware(
 )
 
 
-# ---------------- Schemas ----------------
+# =========================
+# Schemas
+# =========================
 class RecommendIn(BaseModel):
     dataset: str
     user_id: str
@@ -265,13 +501,13 @@ class ChatIn(BaseModel):
     dataset: Optional[str] = None
     user_id: Optional[str] = None
     k: int = 5
-    # These are present in schema for future compatibility, but the agent
-    # may or may not accept them; we filter before calling reply().
     use_faiss: bool = False
     faiss_name: Optional[str] = None
 
 
-# ---------------- Endpoints ----------------
+# =========================
+# Endpoints
+# =========================
 @app.get("/users")
 def list_users(dataset: str = Query(..., description="Dataset name, e.g., 'beauty'")):
     try:
@@ -287,18 +523,7 @@ def list_users(dataset: str = Query(..., description="Dataset name, e.g., 'beaut
         df_ids = pd.read_parquet(fp_ids, columns=["user_id"])
         users = sorted(df_ids["user_id"].astype(str).unique().tolist())
 
-        # optional names
-        names_fp = proc / "user_map.parquet"
-        names = {}
-        if names_fp.exists():
-            df_names = pd.read_parquet(names_fp)
-            if "user_id" in df_names.columns and "user_name" in df_names.columns:
-                for r in df_names.itertuples(index=False):
-                    uid = str(getattr(r, "user_id"))
-                    nm  = getattr(r, "user_name")
-                    if uid and uid not in names and pd.notna(nm):
-                        names[uid] = str(nm)
-        # Try to include optional user name map if present (built by build_catalog.py)
+        # optional names (built by build_catalog.py)
         names = {}
         try:
             umap_fp = proc / "user_map.parquet"
@@ -310,16 +535,18 @@ def list_users(dataset: str = Query(..., description="Dataset name, e.g., 'beaut
                     names = dict(zip(umap["user_id"], umap["user_name"].fillna("").astype(str)))
         except Exception:
             names = {}
-            
+
         return {"dataset": dataset, "count": len(users), "users": users, "names": names}
 
     except Exception as e:
         tb = traceback.format_exc(limit=2)
         return JSONResponse(status_code=500, content={"detail": f"/users failed: {e}", "traceback": tb})
-    
+
+
 @app.get("/agentz")
 def agentz():
     return _agent_introspection()
+
 
 @app.post("/recommend")
 def make_recommend(body: RecommendIn):
@@ -373,12 +600,73 @@ def make_recommend(body: RecommendIn):
                 )
 
         out = recommend_for_user(cfg)
-        # Robust cap so we never exceed available results
+
+                # Cap and enrich
         out_recs = (out.get("recommendations") or [])[: int(cfg.k)]
         out_recs = _enrich_with_catalog(body.dataset, out_recs)
+
+        # Normalize categories (fixes cases like ["[]"] or "['A','B']" etc.)
+        _normalize_categories_in_place(out_recs)
+
+        # Final coercions (price/score/image_url/rank clean)
+        for r in out_recs:
+            # rank → prefer rank_num, else parse digits from rank string, else int if numeric
+            rn = r.get("rank_num")
+            if rn is not None:
+                try:
+                    r["rank"] = int(rn)
+                except Exception:
+                    r["rank"] = None
+            else:
+                rv = r.get("rank")
+                if isinstance(rv, str):
+                    m = re.search(r"[\d,]+", rv)
+                    r["rank"] = int(m.group(0).replace(",", "")) if m else None
+                elif isinstance(rv, (int, float)):
+                    try:
+                        r["rank"] = int(rv)
+                    except Exception:
+                        r["rank"] = None
+                else:
+                    r["rank"] = None
+
+            # price
+            v = r.get("price")
+            try:
+                rv = float(v) if v not in (None, "", "nan") else None
+                if isinstance(rv, float) and not math.isfinite(rv):
+                    rv = None
+                r["price"] = rv
+            except Exception:
+                r["price"] = None
+
+            # score
+            v = r.get("score")
+            try:
+                rv = float(v) if v not in (None, "", "nan") else None
+                if isinstance(rv, float) and not math.isfinite(rv):
+                    rv = None
+                r["score"] = rv
+            except Exception:
+                r["score"] = None
+
+            # image_url → single string
+            v = r.get("image_url")
+            if isinstance(v, list):
+                r["image_url"] = next((u for u in v if isinstance(u, str) and u.strip()), None)
+            elif isinstance(v, str):
+                r["image_url"] = v.strip() or None
+            else:
+                r["image_url"] = None
+
+            # FINAL guard: exactly ['[]'] → []
+            cats = r.get("categories")
+            if isinstance(cats, list) and len(cats) == 1 and isinstance(cats[0], str) and cats[0].strip() == "[]":
+                r["categories"] = []
+
         out["recommendations"] = _to_jsonable(out_recs)
         return JSONResponse(content=out)
-
+        
     except FileNotFoundError:
         return JSONResponse(
             status_code=400,
@@ -395,6 +683,7 @@ def make_recommend(body: RecommendIn):
             status_code=500,
             content={"detail": f"/recommend failed: {e}", "traceback": tb},
         )
+
 
 @app.post("/chat_recommend")
 def chat_recommend(body: ChatIn):
@@ -418,7 +707,6 @@ def chat_recommend(body: ChatIn):
                 "dataset": body.dataset,
                 "user_id": body.user_id,
                 "k": body.k,
-                # don't pass use_faiss/faiss_name unless agent supports them
                 "use_faiss": body.use_faiss,
                 "faiss_name": body.faiss_name,
             }
@@ -433,12 +721,10 @@ def chat_recommend(body: ChatIn):
             else:
                 out["reply"] = str(agent_out) if agent_out is not None else ""
 
-        # ensure list[dict]
         recs = [dict(r) if not isinstance(r, dict) else r for r in (recs or [])]
 
         # === 2) If agent returned nothing, fallback to recommender ===
         if not recs:
-            # make a safe RecommendConfig; default to concat/no-faiss
             cfg = RecommendConfig(
                 dataset=body.dataset or "beauty",
                 user_id=str(body.user_id or ""),
@@ -459,11 +745,11 @@ def chat_recommend(body: ChatIn):
             except Exception:
                 recs = recs  # keep empty on failure
 
-        # === 3) Normalize fields (categories, score, price) ===
-        _normalize_categories_in_place(recs)
+        # === 3) Enrich + normalize like /recommend ===
+        recs = _enrich_with_catalog(body.dataset or "beauty", recs)
 
         for r in recs:
-            # coerce price
+            # price
             v = r.get("price")
             try:
                 rv = float(v) if v not in (None, "", "nan") else None
@@ -472,7 +758,7 @@ def chat_recommend(body: ChatIn):
                 r["price"] = rv
             except Exception:
                 r["price"] = None
-            # coerce score
+            # score
             v = r.get("score")
             try:
                 rv = float(v) if v not in (None, "", "nan") else None
@@ -481,6 +767,14 @@ def chat_recommend(body: ChatIn):
                 r["score"] = rv
             except Exception:
                 r["score"] = None
+            # image_url as single string
+            v = r.get("image_url")
+            if isinstance(v, list):
+                r["image_url"] = next((u for u in v if isinstance(u, str) and u.strip()), None)
+            elif isinstance(v, str):
+                r["image_url"] = v.strip() or None
+            else:
+                r["image_url"] = None
 
         # === 4) Apply lightweight chat constraints (budget + keyword) ===
         last = (msgs[-1]["content"] if msgs else "") or ""
@@ -498,24 +792,9 @@ def chat_recommend(body: ChatIn):
                 hay = " ".join(fields).lower()
                 return lowkw in hay
             filtered = [r for r in recs if _matches(r)]
-            # only narrow if we actually get something
             if filtered:
                 recs = filtered
-        # --- FINAL categories fix (right before returning) ---
-        for r in recs:
-            cats = r.get("categories")
-            # If it's exactly one string like "['A','B']" -> parse it
-            if isinstance(cats, list) and len(cats) == 1 and isinstance(cats[0], str):
-                try:
-                    lit = cats[0].strip()
-                    if (lit.startswith("[") and lit.endswith("]")) or (lit.startswith("(") and lit.endswith(")")):
-                        parsed = ast.literal_eval(lit)
-                        if isinstance(parsed, (list, tuple, set)):
-                            r["categories"] = [str(x).strip() for x in parsed if x is not None and str(x).strip()]
-                except Exception:
-                    # leave as-is if it can't be parsed
-                    pass
-        # === 5) Return ===
+
         out.setdefault("reply", "")
         out["recommendations"] = recs
         return JSONResponse(content=_to_jsonable(out))
@@ -526,7 +805,8 @@ def chat_recommend(body: ChatIn):
             status_code=400,
             content={"detail": f"/chat_recommend failed: {e}", "traceback": tb},
         )
-    
+
+
 @app.get("/healthz")
 def healthz():
     return {

@@ -24,13 +24,15 @@ import argparse
 import csv
 import json
 import math
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import psutil
 
 from src.models.text_encoder import TextEncoder
 from src.data.registry import get_paths
@@ -213,13 +215,14 @@ def plot_metrics(run_name: str, metrics: Dict[str, float]) -> None:
     plt.xticks(x, [run_name], rotation=20)
     plt.ylim(0, 1)
     plt.legend()
-    plt.title("Top‑K Metrics")
+    plt.title("Top-K Metrics")
     p = LOGS_DIR / f"{run_name}_metrics.png"
     plt.savefig(p, bbox_inches="tight", dpi=150)
     plt.close()
 
 
 def append_metrics_csv(dataset: str, run_name: str, model: str, k: int, metrics: Dict[str, float]) -> None:
+    """(Still available if other scripts call it)"""
     row = {
         "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
         "dataset": dataset,
@@ -248,6 +251,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--run_name", default=None, help="name for logs/plots filenames")
+    ap.add_argument("--run_group", default="", help="Optional experiment tag to group related runs")
+    ap.add_argument("--no_log", action="store_true", help="Do not append to logs/metrics.csv")
     return ap.parse_args()
 
 
@@ -278,15 +283,56 @@ def main():
     print(f"✅ Saved user vectors → {processed_dir / 'user_text_emb.parquet'}")
 
     print("🔹 Running quick evaluation …")
+    t0 = time.time()
     metrics = evaluate_topk(user_vecs_df, item_vec, item_ids, test, k=args.k)
-    print("📊 Metrics:", json.dumps(metrics, indent=2))
+    eval_latency_ms = (time.time() - t0) * 1000.0
 
-    # Save JSON + simple charts + CSV row
+    # Rough process RSS at the end of eval (in MB)
+    memory_mb = psutil.Process().memory_info().rss / 1e6
+
+    print("📊 Metrics:", json.dumps(metrics, indent=2))
+    print(f"⏱️  eval_latency_ms = {eval_latency_ms:.2f} ms")
+    print(f"🧠  memory_mb       = {memory_mb:.2f} MB")
+
+    # Save JSON + simple charts
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     out_json = save_metrics(run_name, metrics)
     plot_metrics(run_name, metrics)
-    append_metrics_csv(args.dataset, run_name, args.model, args.k, metrics)
     print(f"📝 Saved → {out_json}")
+
+    # Append a richer row to logs/metrics.csv (idempotent & adds columns if missing)
+    csv_fp = LOGS_DIR / "metrics.csv"
+    hkey = f"hit@{args.k}"
+    dkey = f"ndcg@{args.k}"
+    row = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+        "dataset": args.dataset,
+        "run_name": run_name,
+        "model": args.model,
+        "k": int(args.k),
+        # generic columns reflect the chosen K
+        "hit": float(metrics.get(hkey, metrics.get("hit", 0.0))),
+        "ndcg": float(metrics.get(dkey, metrics.get("ndcg", 0.0))),
+        # also store the exact-K columns for easy plotting
+        hkey: float(metrics.get(hkey, metrics.get("hit", 0.0))),
+        dkey: float(metrics.get(dkey, metrics.get("ndcg", 0.0))),
+        # diagnostics
+        "latency_ms": round(eval_latency_ms, 2),
+        "memory_mb": round(memory_mb, 2),
+    }
+
+    if csv_fp.exists():
+        df_csv = pd.read_csv(csv_fp)
+        # ensure all new columns exist
+        for c in row.keys():
+            if c not in df_csv.columns:
+                df_csv[c] = None
+        df_csv.loc[len(df_csv)] = row
+    else:
+        df_csv = pd.DataFrame([row], columns=list(row.keys()))
+
+    df_csv.to_csv(csv_fp, index=False)
+    print(f"🧾 Appended metrics → {csv_fp}")
 
 
 if __name__ == "__main__":
