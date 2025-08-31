@@ -1,0 +1,51 @@
+<html><head><meta charset='utf-8'><title>Report</title></head><body>
+<pre style='font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'># beauty — FAISS vs No-FAISS @k=10
+
+## Top runs (auto)
+
+| run_name                           | dataset   | fusion   |   w_text |   w_image |   w_meta |    hit@k |   ndcg@k |
+|:-----------------------------------|:----------|:---------|---------:|----------:|---------:|---------:|---------:|
+| concat_k10_wt1_wi0_wm0_faiss       | beauty    | concat   |        1 |       0   |      0   | 0.4913   | 0.368351 |
+| concat_k10_wt1_wi0_wm0             | beauty    | concat   |        1 |       0   |      0   | 0.4913   | 0.368351 |
+| weighted_k10_wt1_wi0.2_wm0.2_faiss | beauty    | weighted |        1 |       0.2 |      0.2 | 0.822927 | 0.344126 |
+
+### Recommendation (auto)
+
+```json
+{
+  "dataset": "beauty",
+  "k": 10,
+  "recommended_run": "concat_k10_wt1_wi0_wm0_faiss",
+  "fusion": "concat",
+  "weights": {
+    "w_text": 1.0,
+    "w_image": 0.0,
+    "w_meta": 0.0
+  },
+  "metrics": {
+    "hit@10": 0.4912998974323272,
+    "ndcg@10": 0.3683509546803032
+  }
+}
+```
+
+### Baseline 4-way comparison (FAISS × Fusion)
+
+| faiss   | fusion   | run_name                           |    hit@k |   ndcg@k |
+|:--------|:---------|:-----------------------------------|---------:|---------:|
+| No      | concat   | concat_k10_wt1_wi0_wm0             | 0.4913   | 0.368351 |
+| No      | weighted | weighted_k10_wt1_wi0.2_wm0.2       | 0.822927 | 0.344126 |
+| Yes     | concat   | concat_k10_wt1_wi0_wm0_faiss       | 0.4913   | 0.368351 |
+| Yes     | weighted | weighted_k10_wt1_wi0.2_wm0.2_faiss | 0.822927 | 0.344126 |
+
+## Metrics snapshot
+
+
+| run_name                           | dataset   | fusion   |   w_text |   w_image |   w_meta |   k |   hit@10 |   ndcg@10 |    p50_ms |   p95_ms |
+|:-----------------------------------|:----------|:---------|---------:|----------:|---------:|----:|---------:|----------:|----------:|---------:|
+| concat_k10_wt1_wi0_wm0             | beauty    | concat   |        1 |       0   |      0   |  10 | 0.4913   |  0.368351 | 0.243015  | 0.37814  |
+| weighted_k10_wt1_wi0.2_wm0.2       | beauty    | weighted |        1 |       0.2 |      0.2 |  10 | 0.822927 |  0.344126 | 0.0997635 | 0.184665 |
+| concat_k10_wt1_wi0_wm0_faiss       | beauty    | concat   |        1 |       0   |      0   |  10 | 0.4913   |  0.368351 | 0.115228  | 0.158001 |
+| weighted_k10_wt1_wi0.2_wm0.2_faiss | beauty    | weighted |        1 |       0.2 |      0.2 |  10 | 0.822927 |  0.344126 | 0.144219  | 0.28256  |
+</pre>
+</body></html>
