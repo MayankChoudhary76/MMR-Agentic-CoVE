@@ -1,61 +1,29 @@
-# ------------------------
-# Python / Virtual Envs
-# ------------------------
+# venv / environment
 .venv/
-venv/
-ENV/
-env/
-__pycache__/
-*.py[cod]
-*.egg-info/
-*.egg
+.env
+.python-version
 
-# ------------------------
-# Logs / Temp
-# ------------------------
-*.log
-*.tmp
-*.out
+# Python cache
+__pycache__/
+*.pyc
+
+# Notebooks junk
+.ipynb_checkpoints/
+
+# OS junk
 .DS_Store
 
-# ------------------------
-# Jupyter / Gradio
-# ------------------------
-.ipynb_checkpoints/
-.gradio/
-*.sqlite
-
-# ------------------------
-# Local Data
-# ------------------------
-data/cache/
-data/processed/
+# Data (raw + processed artifacts)
 data/raw/
-!data/README.md   # keep a placeholder if needed
+data/processed/**/index/*.faiss
+data/processed/**/index/*.npy
+data/processed/**/*.parquet
 
-# ------------------------
-# FAISS Indexes / Embeddings
-# ------------------------
+# Experiments / outputs
+logs/
+reports/
+
+# Misc large artifacts
 *.faiss
 *.npy
-*.npz
 *.parquet
-*.h5
-
-# ------------------------
-# Build / Dist
-# ------------------------
-build/
-dist/
-*.whl
-
-# ------------------------
-# Checkpoints / Models
-# ------------------------
-checkpoints/
-models/
-*.pt
-*.pth
-*.bin
-*.ckpt
-logs/
