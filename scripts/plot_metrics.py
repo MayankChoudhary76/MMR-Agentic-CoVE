@@ -35,20 +35,35 @@ def _ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
             pass
     return df
 
+def _metric_cols(df: pd.DataFrame, k: int) -> tuple[str|None, str|None]:
+    hitc  = f"hit@{k}"  if f"hit@{k}"  in df.columns else ("hit"  if "hit"  in df.columns else None)
+    ndcgc = f"ndcg@{k}" if f"ndcg@{k}" in df.columns else ("ndcg" if "ndcg" in df.columns else None)
+    return hitc, ndcgc
+
 def _maybe_plot_quality(df: pd.DataFrame, k: int, out_dir: pathlib.Path, dataset: str):
-    needed = {"hit", "ndcg"}
-    if not needed.issubset(set(df.columns)):
-        print("• Skipping quality comparison (missing hit/ndcg).")
+    hit_col, ndcg_col = _metric_cols(df, k)
+    if not hit_col and not ndcg_col:
+        print("• Skipping quality comparison (no hit/ndcg columns).")
         return
 
     labels = df["run_name"].astype(str).tolist()
-    hit  = df["hit"].astype(float).tolist()
-    ndcg = df["ndcg"].astype(float).tolist()
     x = range(len(labels)); width = 0.35
-
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar([i - width/2 for i in x], hit,  width, label=f"Hit@{k}")
-    ax.bar([i + width/2 for i in x], ndcg, width, label=f"NDCG@{k}")
+
+    plotted = False
+    if hit_col:
+        hit = df[hit_col].astype(float).tolist()
+        ax.bar([i - (width/2 if ndcg_col else 0) for i in x], hit, width, label=f"{hit_col}")
+        plotted = True
+    if ndcg_col:
+        ndcg = df[ndcg_col].astype(float).tolist()
+        ax.bar([i + (width/2 if hit_col else 0) for i in x], ndcg, width, label=f"{ndcg_col}")
+        plotted = True
+
+    if not plotted:
+        print("• Skipping quality comparison (no plottable series).")
+        return
+
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=15)
     ax.set_ylim(0, 1.0)
@@ -61,40 +76,25 @@ def _maybe_plot_quality(df: pd.DataFrame, k: int, out_dir: pathlib.Path, dataset
     fig.savefig(out, dpi=150)
     print(f"📈 Saved {out}")
 
-    # Optional MRR
-    if "mrr" in df.columns:
-        mrr = df["mrr"].astype(float).tolist()
-        fig2, ax2 = plt.subplots(figsize=(10, 4))
-        ax2.bar(x, mrr, width=0.6, label="MRR")
-        ax2.set_xticks(list(x))
-        ax2.set_xticklabels(labels, rotation=15)
-        ax2.set_ylim(0, 1.0)
-        ax2.set_ylabel("Score")
-        ax2.set_title(f"MRR — {dataset} (K={k})")
-        annotate_bars(ax2, "{:.3f}")
-        fig2.tight_layout()
-        out2 = out_dir / f"{dataset}_k{k}_mrr.png"
-        fig2.savefig(out2, dpi=150)
-        print(f"📈 Saved {out2}")
-
-    # Trend lines if timestamp available
-    if "timestamp" in df.columns:
+    # Trend lines if timestamp is present
+    if "timestamp" in df.columns and (hit_col or ndcg_col):
         try:
             dft = df.copy()
-            dft["ts"] = pd.to_datetime(dft["timestamp"])
-            fig3, ax3 = plt.subplots(figsize=(10, 4))
-            ax3.plot(dft["ts"], dft["hit"],  marker="o", label=f"Hit@{k}")
-            ax3.plot(dft["ts"], dft["ndcg"], marker="o", label=f"NDCG@{k}")
-            if "mrr" in dft.columns:
-                ax3.plot(dft["ts"], dft["mrr"], marker="o", label="MRR")
-            ax3.set_ylim(0, 1.0)
-            ax3.set_ylabel("Score")
-            ax3.set_title(f"Quality Trend — {dataset} (K={k})")
-            ax3.legend()
-            fig3.autofmt_xdate()
-            out3 = out_dir / f"{dataset}_k{k}_quality_trend.png"
-            fig3.savefig(out3, dpi=150)
-            print(f"📉 Saved {out3}")
+            dft["ts"] = pd.to_datetime(dft["timestamp"], format="ISO8601", utc=True, errors="coerce")
+            dft = dft.dropna(subset=["ts"])
+            fig2, ax2 = plt.subplots(figsize=(10, 4))
+            if hit_col:
+                ax2.plot(dft["ts"], dft[hit_col],  marker="o", label=hit_col)
+            if ndcg_col:
+                ax2.plot(dft["ts"], dft[ndcg_col], marker="o", label=ndcg_col)
+            ax2.set_ylim(0, 1.0)
+            ax2.set_ylabel("Score")
+            ax2.set_title(f"Quality Trend — {dataset} (K={k})")
+            ax2.legend()
+            fig2.autofmt_xdate()
+            out2 = out_dir / f"{dataset}_k{k}_quality_trend.png"
+            fig2.savefig(out2, dpi=150)
+            print(f"📉 Saved {out2}")
         except Exception as e:
             print(f"• Skipping trend plot (time parse failed): {e}")
 
@@ -162,7 +162,7 @@ def main():
     if not csv_path.exists():
         raise SystemExit(f"Missing {csv_path}. Run an eval and append a row first.")
 
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
     # Basic filtering
     if "dataset" in df.columns:
         df = df[df["dataset"] == args.dataset]

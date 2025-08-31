@@ -1,0 +1,83 @@
+{
+  "dataset": "beauty",
+  "tag": "FAISS vs No-FAISS @k=10",
+  "k": 10,
+  "include_compare": true,
+  "recommendation": {
+    "dataset": "beauty",
+    "k": 10,
+    "recommended_run": "concat_k10_wt1_wi0_wm0_faiss",
+    "fusion": "concat",
+    "weights": {
+      "w_text": 1.0,
+      "w_image": 0.0,
+      "w_meta": 0.0
+    },
+    "metrics": {
+      "hit@10": 0.4912998974323272,
+      "ndcg@10": 0.3683509546803032
+    }
+  },
+  "top_runs": [
+    {
+      "run_name": "concat_k10_wt1_wi0_wm0_faiss",
+      "dataset": "beauty",
+      "fusion": "concat",
+      "w_text": 1.0,
+      "w_image": 0.0,
+      "w_meta": 0.0,
+      "hit@10": 0.4912998974,
+      "ndcg@10": 0.3683509547
+    },
+    {
+      "run_name": "concat_k10_wt1_wi0_wm0",
+      "dataset": "beauty",
+      "fusion": "concat",
+      "w_text": 1.0,
+      "w_image": 0.0,
+      "w_meta": 0.0,
+      "hit@10": 0.4912998974,
+      "ndcg@10": 0.3683509547
+    },
+    {
+      "run_name": "weighted_k10_wt1_wi0.2_wm0.2_faiss",
+      "dataset": "beauty",
+      "fusion": "weighted",
+      "w_text": 1.0,
+      "w_image": 0.2,
+      "w_meta": 0.2,
+      "hit@10": 0.8229273558,
+      "ndcg@10": 0.3441258816
+    }
+  ],
+  "baseline_quadrant": [
+    {
+      "faiss": "No",
+      "fusion": "concat",
+      "run_name": "concat_k10_wt1_wi0_wm0",
+      "hit@k": 0.4912998974,
+      "ndcg@k": 0.3683509547
+    },
+    {
+      "faiss": "No",
+      "fusion": "weighted",
+      "run_name": "weighted_k10_wt1_wi0.2_wm0.2",
+      "hit@k": 0.8229273558,
+      "ndcg@k": 0.3441258816
+    },
+    {
+      "faiss": "Yes",
+      "fusion": "concat",
+      "run_name": "concat_k10_wt1_wi0_wm0_faiss",
+      "hit@k": 0.4912998974,
+      "ndcg@k": 0.3683509547
+    },
+    {
+      "faiss": "Yes",
+      "fusion": "weighted",
+      "run_name": "weighted_k10_wt1_wi0.2_wm0.2_faiss",
+      "hit@k": 0.8229273558,
+      "ndcg@k": 0.3441258816
+    }
+  ]
+}

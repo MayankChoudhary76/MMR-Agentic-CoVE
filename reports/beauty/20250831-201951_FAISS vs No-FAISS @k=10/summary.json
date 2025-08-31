@@ -1,0 +1,6 @@
+{
+  "dataset": "beauty",
+  "tag": "FAISS vs No-FAISS @k=10",
+  "k": 10,
+  "include_compare": true
+}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 
 from src.agents.orchestrator import Orchestrator
-from src.agents.types import Task
+from src.agents.agent_types import Task
 
 
 def parse_args():

@@ -1,277 +1,319 @@
+#!/usr/bin/env python3
 # src/agents/report_agent.py
 from __future__ import annotations
 
-import csv
+import argparse
 import json
 import os
-import re
-import shutil
-import sys
-import subprocess
-from dataclasses import dataclass, asdict
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
+import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[2]  # repo root
-LOGS_DIR = ROOT / "logs"
-PLOTS_DIR = LOGS_DIR / "plots"
-REPORTS_DIR = ROOT / "reports"
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[2]  # repo root (/notebooks/MMR-Agentic-CoVE)
+LOGS = ROOT / "logs"
+PLOTS = LOGS / "plots"
+REPORTS_ROOT = ROOT / "reports"
 
-
-@dataclass
-class RunRow:
-    run_name: str
-    dataset: str
-    k: Optional[int]
-    hit: Optional[float]
-    ndcg: Optional[float]
-    latency_ms_p50: Optional[float] = None
-    latency_ms_p95: Optional[float] = None
-    recall: Optional[float] = None
-    mrr: Optional[float] = None
-    timestamp: Optional[str] = None
-
-
-def _sf(x: str | float | None) -> Optional[float]:
-    try:
-        if x is None or x == "":
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def _read_metrics_csv(csv_path: Path) -> List[RunRow]:
-    rows: List[RunRow] = []
-    if not csv_path.exists():
-        return rows
-    with csv_path.open("r", newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for d in r:
-            rows.append(
-                RunRow(
-                    run_name=d.get("run_name", ""),
-                    dataset=d.get("dataset", ""),
-                    k=int(d["k"]) if d.get("k") else None,
-                    hit=_sf(d.get("hit") or d.get("hit@10") or d.get("hit@k")),
-                    ndcg=_sf(d.get("ndcg") or d.get("ndcg@10") or d.get("ndcg@k")),
-                    latency_ms_p50=_sf(d.get("latency_ms_p50")),
-                    latency_ms_p95=_sf(d.get("latency_ms_p95")),
-                    recall=_sf(d.get("recall")),
-                    mrr=_sf(d.get("mrr")),
-                    timestamp=d.get("timestamp"),
-                )
-            )
-    return rows
-
-
-def _best(rows: List[RunRow], key: str) -> Optional[RunRow]:
-    rows2 = [r for r in rows if getattr(r, key) is not None]
-    if not rows2:
-        return None
-    return max(rows2, key=lambda r: getattr(r, key) or -1)
-
-
-def _ensure_dir(p: Path) -> Path:
+def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
-    return p
 
+def _load_metrics(csv_fp: Path) -> pd.DataFrame:
+    if not csv_fp.exists():
+        raise FileNotFoundError(f"Missing metrics CSV: {csv_fp}")
+    df = pd.read_csv(csv_fp, engine="python")
+    # normalize
+    for col in ["run_name", "dataset", "fusion"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+    for wcol in ["w_text", "w_image", "w_meta"]:
+        if wcol not in df.columns:
+            df[wcol] = float("nan")
+    # convenience flags
+    if "faiss" not in df.columns:
+        df["faiss"] = df["run_name"].str.contains("faiss", case=False, na=False).astype(bool)
+    return df
 
-def _copy_matching(src_dir: Path, dst_dir: Path, dataset: str, patterns: Tuple[str, ...]) -> List[Path]:
-    """Copy files that start with '<dataset>_' and end with any of patterns."""
-    copied: List[Path] = []
-    if not src_dir.exists():
-        return copied
-    for fp in sorted(src_dir.iterdir()):
-        if not fp.is_file():
-            continue
-        name = fp.name
-        if not name.startswith(f"{dataset}_"):
-            continue
-        if any(name.endswith(suf) for suf in patterns):
-            out = dst_dir / name
-            shutil.copy2(fp, out)
-            copied.append(out)
+def _metric_cols(df: pd.DataFrame, k: int) -> Dict[str, Optional[str]]:
+    # prefer explicit @k
+    hit_col = f"hit@{k}" if f"hit@{k}" in df.columns else ("hit" if "hit" in df.columns else None)
+    ndcg_col = f"ndcg@{k}" if f"ndcg@{k}" in df.columns else ("ndcg" if "ndcg" in df.columns else None)
+    return {"hit": hit_col, "ndcg": ndcg_col}
+
+def _top_n_table(
+    df: pd.DataFrame, dataset: str, k: int, top_n: int = 5,
+    prefer_faiss: bool = True
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    df = df.copy()
+    df = df[df["dataset"] == dataset] if "dataset" in df.columns else df
+
+    cols = _metric_cols(df, k)
+    hitc, ndcgc = cols["hit"], cols["ndcg"]
+    if not ndcgc and not hitc:
+        raise ValueError(f"No hit/ndcg columns found for k={k}. Available: {list(df.columns)}")
+
+    # sort keys: ndcg desc, then hit desc; optional FAISS preference when tied
+    sort_cols = []
+    if ndcgc: sort_cols.append(ndcgc)
+    if hitc:  sort_cols.append(hitc)
+    if not sort_cols:
+        raise ValueError("No sortable metric columns.")
+    df["_faiss"] = df.get("faiss", df["run_name"].str.contains("faiss", case=False, na=False)).astype(int)
+    by = [c for c in sort_cols] + (["_faiss"] if prefer_faiss else [])
+    df_sorted = df.sort_values(by=by, ascending=[False]*len(by))
+
+    # build a compact table for the report
+    keep_cols = ["run_name", "dataset", "fusion", "w_text", "w_image", "w_meta"]
+    if hitc:  keep_cols.append(hitc)
+    if ndcgc: keep_cols.append(ndcgc)
+
+    top = df_sorted[keep_cols].head(top_n).reset_index(drop=True)
+
+    # choose recommendation = first row
+    rec_row = top.iloc[0].to_dict()
+    rec = {
+        "dataset": dataset,
+        "k": k,
+        "recommended_run": rec_row["run_name"],
+        "fusion": rec_row.get("fusion"),
+        "weights": {
+            "w_text": float(rec_row.get("w_text")) if pd.notna(rec_row.get("w_text")) else None,
+            "w_image": float(rec_row.get("w_image")) if pd.notna(rec_row.get("w_image")) else None,
+            "w_meta": float(rec_row.get("w_meta")) if pd.notna(rec_row.get("w_meta")) else None,
+        },
+        "metrics": {
+            (hitc or "hit"): float(rec_row.get(hitc)) if hitc else None,
+            (ndcgc or "ndcg"): float(rec_row.get(ndcgc)) if ndcgc else None,
+        },
+    }
+    return top, rec
+
+def _md_table(df: pd.DataFrame) -> str:
+    """
+    Return a markdown-ish table. Falls back to a preformatted text block if
+    pandas' to_markdown requires 'tabulate' and it's not installed.
+    """
+    try:
+        return df.to_markdown(index=False)
+    except Exception:
+        # Fallback: plain text inside code fences so the report still renders.
+        return "```\n" + df.to_string(index=False) + "\n```"
+def _copy_plots_into(out_dir: Path, dataset: str) -> list[str]:
+    """
+    Return the list of plot filenames that were copied into out_dir.
+    Only copies files that exist under logs/plots.
+    """
+    wanted = [
+        f"{dataset}_k10_quality.png",
+        f"{dataset}_k10_quality_trend.png",
+        f"{dataset}_k10_latency.png",
+        f"{dataset}_w_meta_ndcg@10.png",
+        f"{dataset}_w_meta_hit@10.png",
+        f"{dataset}_k_ndcg@10.png",
+    ]
+    copied: list[str] = []
+    for name in wanted:
+        src = PLOTS / name
+        if src.exists():
+            try:
+                import shutil
+                dst = out_dir / name
+                shutil.copy2(src, dst)
+                copied.append(name)
+            except Exception:
+                pass
     return copied
 
-
-class ReportAgent:
+def _baseline_quadrant(df: pd.DataFrame, dataset: str, k: int) -> Optional[pd.DataFrame]:
     """
-    Generates a self-contained report folder:
-      reports/<dataset>/<YYYYmmdd_HHMMSS>/
-        - metrics.csv
-        - all PNGs + JSONs from logs/plots matching '<dataset>_*'
-        - summary.json (top runs, best metrics)
-        - index.md + index.html (easy to browse)
-        - (optional) archive.zip
+    Build a compact 2x2 comparison if rows exist:
+      No-FAISS / FAISS   ×   concat / weighted
     """
+    cols = _metric_cols(df, k)
+    hitc, ndcgc = cols["hit"], cols["ndcg"]
+    if not ndcgc and not hitc:
+        return None
 
-    def build_plots(self, dataset: str = "beauty") -> None:
-        """Run your existing plotting scripts."""
-        print(f"→ Generating plots for dataset='{dataset}'")
-        subprocess.check_call([sys.executable, "scripts/plot_metrics.py", "--dataset", dataset])
-        # These defaults expect you to encode a sweep key in run_name (e.g. wm0.3)
-        # You can call plot_sweeps.py multiple times with different sweep keys if desired.
-        for sweep_key, metric in [("wm", "ndcg"), ("wm", "hit")]:
-            try:
-                subprocess.check_call([
-                    sys.executable, "scripts/plot_sweeps.py",
-                    "--dataset", dataset,
-                    "--sweep_key", sweep_key,
-                    "--metric", metric,
-                ])
-            except subprocess.CalledProcessError:
-                # It's okay if no rows match; continue.
-                pass
+    d = df.copy()
+    if "dataset" in d.columns:
+        d = d[d["dataset"] == dataset]
+    if "fusion" not in d.columns:
+        return None
+    if "faiss" not in d.columns:
+        d["faiss"] = d["run_name"].str.contains("faiss", case=False, na=False).astype(bool)
 
-    def assemble_report(self, dataset: str = "beauty", tag: Optional[str] = None, zip_report: bool = False) -> Path:
-        """
-        Bundle artifacts into a versioned folder and write a summary.
-        Returns the report directory path.
-        """
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        label = f"{ts}" + (f"_{tag}" if tag else "")
-        out_dir = _ensure_dir(REPORTS_DIR / dataset / label)
-        print(f"→ Assembling report at {out_dir}")
-
-        # 1) Copy metrics.csv
-        metrics_csv_src = LOGS_DIR / "metrics.csv"
-        if metrics_csv_src.exists():
-            shutil.copy2(metrics_csv_src, out_dir / "metrics.csv")
-
-        # 2) Copy plots & JSONs for this dataset
-        copied_png = _copy_matching(PLOTS_DIR, out_dir, dataset, (".png",))
-        copied_json = _copy_matching(PLOTS_DIR, out_dir, dataset, (".json",))
-
-        # 3) Build summary from metrics.csv filtered by dataset
-        all_rows = _read_metrics_csv(metrics_csv_src)
-        rows = [r for r in all_rows if r.dataset == dataset]
-        best_hit = _best(rows, "hit")
-        best_ndcg = _best(rows, "ndcg")
-
-        summary = {
-            "dataset": dataset,
-            "created_at": ts,
-            "num_runs": len(rows),
-            "artifacts": {
-                "png": [p.name for p in copied_png],
-                "json": [p.name for p in copied_json],
-                "metrics_csv": "metrics.csv" if metrics_csv_src.exists() else None,
-            },
-            "best_hit": asdict(best_hit) if best_hit else None,
-            "best_ndcg": asdict(best_ndcg) if best_ndcg else None,
-            "runs": [asdict(r) for r in rows],
-        }
-        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-        # 4) Write index.md and index.html
-        self._write_index_md(out_dir, summary)
-        self._write_index_html(out_dir, summary)
-
-        # 5) Optional zip
-        if zip_report:
-            archive = shutil.make_archive(str(out_dir), "zip", root_dir=out_dir)
-            print(f"✓ Zipped to {archive}")
-
-        print("✓ Report ready:", out_dir)
-        return out_dir
-
-    # ---------- helpers for index files ----------
-
-    def _write_index_md(self, out_dir: Path, summary: Dict) -> None:
-        lines = []
-        lines.append(f"# Report — dataset: **{summary['dataset']}**")
-        lines.append(f"_Created at: {summary['created_at']}_\n")
-        lines.append("## Best runs")
-        if summary.get("best_hit"):
-            b = summary["best_hit"]
-            lines.append(f"- **Best Hit@K**: `{b.get('hit')}` • run: `{b.get('run_name')}` • k={b.get('k')}")
-        if summary.get("best_ndcg"):
-            b = summary["best_ndcg"]
-            lines.append(f"- **Best NDCG@K**: `{b.get('ndcg')}` • run: `{b.get('run_name')}` • k={b.get('k')}")
-        lines.append("\n## Artifacts")
-        arts = summary.get("artifacts", {})
-        for k, arr in arts.items():
-            if not arr:
-                continue
-            if isinstance(arr, list):
-                lines.append(f"- **{k.upper()}**: " + ", ".join(f"`{a}`" for a in arr))
+    # For each quadrant, pick the best row (by ndcg then hit)
+    rows = []
+    for fa in [False, True]:
+        for fu in ["concat", "weighted"]:
+            sub = d[(d["fusion"].str.lower()==fu) & (d["faiss"]==fa)]
+            if ndcgc: sub = sub.sort_values(ndcgc, ascending=False)
+            if hitc:
+                sub = sub.sort_values([ndcgc, hitc], ascending=[False, False]) if ndcgc else sub.sort_values(hitc, ascending=False)
+            if sub.empty:
+                rows.append({"faiss": "Yes" if fa else "No", "fusion": fu, "run_name": "—",
+                             "hit@k": None if not hitc else None, "ndcg@k": None if not ndcgc else None})
             else:
-                lines.append(f"- **{k.upper()}**: `{arr}`")
-        lines.append("\n## Plots")
-        for name in arts.get("png", []):
-            lines.append(f"![{name}]({name})")
-        (out_dir / "index.md").write_text("\n".join(lines), encoding="utf-8")
+                r = sub.iloc[0]
+                rows.append({
+                    "faiss": "Yes" if fa else "No",
+                    "fusion": fu,
+                    "run_name": r.get("run_name", ""),
+                    "hit@k": (float(r[hitc]) if hitc else None),
+                    "ndcg@k": (float(r[ndcgc]) if ndcgc else None),
+                })
+    out = pd.DataFrame(rows, columns=["faiss","fusion","run_name","hit@k","ndcg@k"])
+    # Return None if literally no metrics found
+    if out[["hit@k","ndcg@k"]].isna().all().all():
+        return None
+    return out
 
-    def _write_index_html(self, out_dir: Path, summary: Dict) -> None:
-        """Tiny static HTML index so you can open the folder in a browser and click around."""
-        def esc(s: str) -> str:
-            return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def _write_report(
+    out_dir: Path,
+    tag: str,
+    dataset: str,
+    k: Optional[int],
+    include_compare: bool,
+    top_n: int,
+    prefer_faiss: bool,
+    metrics_csv: Path,
+) -> None:
+    _ensure_dir(out_dir)
 
-        arts = summary.get("artifacts", {})
-        rows = summary.get("runs", [])
-        html = []
-        html.append("<!doctype html><meta charset='utf-8'>")
-        html.append("<title>Report</title>")
-        html.append("<style>body{font-family:ui-sans-serif,system-ui;margin:24px;} table{border-collapse:collapse} th,td{border:1px solid #ddd;padding:6px 8px} th{background:#f8f8f8}</style>")
-        html.append(f"<h1>Report — dataset: <b>{esc(summary['dataset'])}</b></h1>")
-        html.append(f"<p><i>Created at: {esc(summary['created_at'])}</i></p>")
+    # Self-contained: copy plots into the report directory
+    copied_plots = _copy_plots_into(out_dir, dataset)
 
-        # Best section
-        html.append("<h2>Best runs</h2><ul>")
-        if summary.get("best_hit"):
-            b = summary["best_hit"]
-            html.append(f"<li><b>Best Hit@K</b>: {esc(str(b.get('hit')))} — run: <code>{esc(b.get('run_name',''))}</code> — k={esc(str(b.get('k')))}</li>")
-        if summary.get("best_ndcg"):
-            b = summary["best_ndcg"]
-            html.append(f"<li><b>Best NDCG@K</b>: {esc(str(b.get('ndcg')))} — run: <code>{esc(b.get('run_name',''))}</code> — k={esc(str(b.get('k')))}</li>")
-        html.append("</ul>")
+    # optional compare section + recommendation
+    compare_md = ""
+    summary_json: Dict[str, Any] = {}
+    if include_compare and k is not None:
+        df_all = _load_metrics(metrics_csv)
+        try:
+            top, rec = _top_n_table(df_all, dataset=dataset, k=k, top_n=top_n, prefer_faiss=prefer_faiss)
+            compare_md = (
+                "## Top runs (auto)\n\n"
+                + _md_table(top.rename(columns={
+                    f"hit@{k}": "hit@k", f"ndcg@{k}": "ndcg@k"
+                })) + "\n\n"
+                "### Recommendation (auto)\n\n"
+                "```json\n" + json.dumps(rec, indent=2) + "\n```\n"
+            )
+            summary_json["recommendation"] = rec
+            summary_json["top_runs"] = json.loads(top.to_json(orient="records"))
 
-        # Table of runs
-        if rows:
-            html.append("<h2>All runs</h2>")
-            html.append("<table><tr><th>run_name</th><th>k</th><th>hit</th><th>ndcg</th><th>p50(ms)</th><th>p95(ms)</th><th>timestamp</th></tr>")
-            for r in rows:
-                html.append(
-                    "<tr>"
-                    f"<td><code>{esc(r.get('run_name',''))}</code></td>"
-                    f"<td>{esc(str(r.get('k')))}</td>"
-                    f"<td>{esc(str(r.get('hit')))}</td>"
-                    f"<td>{esc(str(r.get('ndcg')))}</td>"
-                    f"<td>{esc(str(r.get('latency_ms_p50')))}</td>"
-                    f"<td>{esc(str(r.get('latency_ms_p95')))}</td>"
-                    f"<td>{esc(str(r.get('timestamp')))}</td>"
-                    "</tr>"
-                )
-            html.append("</table>")
+            # Add a 4-way baseline quadrant if possible
+            quad = _baseline_quadrant(df_all, dataset=dataset, k=k)
+            if quad is not None:
+                compare_md += "\n### Baseline 4-way comparison (FAISS × Fusion)\n\n"
+                compare_md += _md_table(quad) + "\n"
+                summary_json["baseline_quadrant"] = json.loads(quad.to_json(orient="records"))
+        except Exception as e:
+            compare_md = f"> Could not compute comparison for k={k}: {e}\n"
 
-        # Plots
-        if arts.get("png"):
-            html.append("<h2>Plots</h2>")
-            for name in arts["png"]:
-                html.append(f"<div><img src='{esc(name)}' style='max-width:100%;height:auto;'/><div><code>{esc(name)}</code></div></div><hr/>")
+    # build markdown
+    md_parts = [f"# {dataset} — {tag}\n"]
+    if include_compare and k is not None:
+        md_parts.append(compare_md)
 
-        (out_dir / "index.html").write_text("\n".join(html), encoding="utf-8")
+    if copied_plots:
+        md_parts.append("## Plots\n")
+        for name in copied_plots:
+            md_parts.append(f"![{name}](./{name})\n")
 
+    # metrics snapshot (also save a filtered CSV into the report for grading)
+    try:
+        dfm = _load_metrics(metrics_csv)
+        snap = dfm[dfm["dataset"] == dataset] if "dataset" in dfm.columns else dfm
+        md_parts.append("## Metrics snapshot\n\n")
+        show_cols = [c for c in ["run_name","dataset","fusion","w_text","w_image","w_meta",
+                                 "k","hit","ndcg","hit@5","ndcg@5","hit@10","ndcg@10","hit@20","ndcg@20","p50_ms","p95_ms"]
+                     if c in snap.columns]
+        if not show_cols:
+            show_cols = list(snap.columns)[:10]
+        md_parts.append(_md_table(snap[show_cols].tail(20)) + "\n")
+        # Save a compact CSV snapshot into the report folder
+        snap.to_csv(out_dir / "metrics.csv", index=False)
+    except Exception as e:
+        md_parts.append(f"> Could not include metrics snapshot: {e}\n")
 
-# ------------------- CLI -------------------
+    # write index.md
+    md_path = out_dir / "index.md"
+    md_path.write_text("\n".join(md_parts), encoding="utf-8")
 
-def _cli():
-    import argparse
+    # render HTML (pretty if markdown package available; otherwise fallback)
+    html_path = out_dir / "index.html"
+    try:
+        import markdown  # type: ignore
+        html = markdown.markdown(md_path.read_text(encoding="utf-8"), extensions=["tables"])
+        html_full = [
+            "<html><head><meta charset='utf-8'><title>Report</title>",
+            "<style>body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto;max-width:900px;margin:40px auto;padding:0 16px} table{border-collapse:collapse} th,td{border:1px solid #ddd;padding:6px 8px}</style>",
+            "</head><body>",
+            html,
+            "</body></html>",
+        ]
+        html_path.write_text("\n".join(html_full), encoding="utf-8")
+    except Exception:
+        # simple fallback
+        html = [
+            "<html><head><meta charset='utf-8'><title>Report</title></head><body>",
+            f"<pre style='font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'>{md_path.read_text(encoding='utf-8')}</pre>",
+            "</body></html>",
+        ]
+        html_path.write_text("\n".join(html), encoding="utf-8")
+
+    # write summary.json
+    (out_dir / "summary.json").write_text(json.dumps({
+        "dataset": dataset,
+        "tag": tag,
+        "k": k,
+        "include_compare": include_compare,
+        **summary_json
+    }, indent=2), encoding="utf-8")
+
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="beauty")
-    ap.add_argument("--tag", default="", help="Optional label appended to report folder name")
-    ap.add_argument("--no-plots", action="store_true", help="Skip running plotting scripts; just gather artifacts")
-    ap.add_argument("--zip", dest="zip_report", action="store_true", help="Zip the final report folder")
+    ap.add_argument("--dataset", required=True)
+    ap.add_argument("--tag", default="report")
+    ap.add_argument("--k", type=int, default=10, help="k to use for comparison tables")
+    ap.add_argument("--include-compare", action="store_true", help="Include Top runs + Recommendation section")
+    ap.add_argument("--top-n", type=int, default=3, help="How many runs to show in the Top table")
+    ap.add_argument("--prefer-faiss", action="store_true", help="Prefer FAISS runs when metrics tie")
+    ap.add_argument("--metrics_csv", default=str(LOGS / "metrics.csv"))
+    ap.add_argument("--plots_dir", default=str(PLOTS))
+    ap.add_argument("--out", default="", help="Optional explicit out path (file or directory)")
+    ap.add_argument("--no-plots", action="store_true", help="(kept for back-compat; plots are referenced if present)")
+    ap.add_argument("--zip", action="store_true", help="Zip the report folder")
     args = ap.parse_args()
 
-    agent = ReportAgent()
-    if not args.no_plots:
-        agent.build_plots(dataset=args.dataset)
-    agent.assemble_report(dataset=args.dataset, tag=(args.tag or None), zip_report=args.zip_report)
+    dataset = args.dataset
+    tag = args.tag
+    out_dir = Path(args.out) if args.out else (REPORTS_ROOT / dataset / f"{pd.Timestamp.now():%Y%m%d_%H%M%S} {tag}")
+    _ensure_dir(out_dir)
 
+    # Create report
+    _write_report(
+        out_dir=out_dir,
+        tag=tag,
+        dataset=dataset,
+        k=args.k if args.include_compare else None,
+        include_compare=args.include_compare,
+        top_n=args.top_n,
+        prefer_faiss=args.prefer_faiss,
+        metrics_csv=Path(args.metrics_csv),
+    )
+
+    print(f"→ Assembling report at {out_dir}")
+    print(f"✓ Report ready: {out_dir}")
+
+    if args.zip:
+        import shutil
+        zpath = out_dir.with_suffix(".zip")
+        base = out_dir.name
+        shutil.make_archive(str(zpath.with_suffix("")), "zip", out_dir.parent, base)
+        print(f"📦 Zipped → {zpath}")
 
 if __name__ == "__main__":
-    _cli()
+    main()
